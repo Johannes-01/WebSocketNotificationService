@@ -1,0 +1,14 @@
+{
+  "name": "connection-handler",
+  "version": "1.0.0",
+  "description": "",
+  "author": "",
+  "type": "commonjs",
+  "main": "index.js",
+  "scripts": {
+    "test": "build"
+  },
+  "dependencies": {
+    "aws-sdk": "^2.1692.0"
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "name": "processor",
+  "version": "1.0.0",
+  "description": "",
+  "author": "",
+  "type": "commonjs",
+  "main": "index.js",
+  "dependencies": {
+    "aws-lambda": "^1.0.7"
+  }
+}
