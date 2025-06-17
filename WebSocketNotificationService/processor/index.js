@@ -1,5 +1,5 @@
 const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
-const { DynamoDBDocumentClient, ScanCommand, DeleteCommand } = require('@aws-sdk/lib-dynamodb');
+const { DynamoDBDocumentClient, QueryCommand, DeleteCommand } = require('@aws-sdk/lib-dynamodb');
 const { ApiGatewayManagementApiClient, PostToConnectionCommand } = require('@aws-sdk/client-apigatewaymanagementapi');
 
 const dynamoClient = new DynamoDBClient({});
@@ -13,24 +13,45 @@ exports.handler = async (event) => {
   console.log('Received SNS event:', JSON.stringify(event, null, 2));
   
   try {
-    // todo: check if the sns message is a json string. if so, parse it
-    const message = event.Records[0].Sns.Message;
+    let message;
+    try {
+      message = JSON.parse(event.Records[0].Sns.Message || '{}');
+    } catch (e) {
+      message = event.Records[0].Sns.Message || 'Empty message';
+    }
+
     console.log('message:', message);
     
-    // Get all connections from Connection Table
-    const scanCommand = new ScanCommand({ 
-      TableName: process.env.CONNECTION_TABLE 
+    const projectId = event.Records[0].Sns.MessageAttributes.projectId.Value;
+    const userId = event.Records[0].Sns.MessageAttributes.userId.Value;
+    const timestamp = event.Records[0].Sns.MessageAttributes.timestamp.Value;
+    console.log(`Received message from userId: ${userId} for projectId: ${projectId}, timestamp: ${timestamp}`);
+
+    if (!projectId || !userId) {
+      console.error('Missing projectId or userId in SNS message attributes');
+      return;
+    }
+
+    // Get all connections for this project to send targeted notifications
+    const queryCommand = new QueryCommand({
+      TableName: process.env.CONNECTION_TABLE,
+      IndexName: 'ProjectUserIndex',
+      KeyConditionExpression: 'projectId = :projectId',
+      ExpressionAttributeValues: {
+        ':projectId': projectId,
+      },
     });
-    const connections = await dynamoDB.send(scanCommand);
-    
-    console.log(`Found ${connections.Items?.length || 0} connections`);
-    
+            
+    const connections = await dynamoDB.send(queryCommand);
+    const connectionCount = connections.Items?.length || 0;
+            
+    console.log(`Found ${connectionCount} connections for project ${projectId}`);
+        
     if (!connections.Items || connections.Items.length === 0) {
       console.log('No connections found');
       return;
     }
 
-    // Send message to all connected clients
     const promises = connections.Items.map(async ({ connectionId }) => {
       try {
         console.log(`Sending message to connection: ${connectionId}`);

@@ -7,11 +7,20 @@ exports.handler = async (event) => {
   const connectionId = event.requestContext.connectionId;
   const { projectId, userId } = event.queryStringParameters || {};
   
+  /*const userId = event.requestContext.authorizer?.userId || "";
+
+  if (!userId) {
+    return {
+      statusCode: 401,
+      body: 'Unauthorized',
+    };
+  }*/
+
   const tableName = process.env.CONNECTION_TABLE;
 
   switch (event.requestContext.routeKey) {
     case '$connect':
-      if (!userId || !projectId) {
+      if (!projectId || !userId) {
         return {
           statusCode: 400,
           body: 'userId and projectId are required query parameters',
@@ -23,7 +32,6 @@ exports.handler = async (event) => {
           connectionId, 
           projectId,
           userId,
-          ttl: Math.floor(Date.now() / 1000) + (60 * 60), // 1 hour TTL
         },
       });
       await putCommand.promise();

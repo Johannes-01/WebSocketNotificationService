@@ -8,11 +8,42 @@ import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as subscription from 'aws-cdk-lib/aws-sns-subscriptions';
 import * as iam from 'aws-cdk-lib/aws-iam';
+import * as congnito from 'aws-cdk-lib/aws-cognito';
 import { Construct } from 'constructs';
 
 export class WebSocketNotificationService extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
+
+    const userPool = new congnito.UserPool(this, 'UserPool', {
+      userPoolName: 'websocket-user-pool',
+      selfSignUpEnabled: true,
+      signInAliases: {
+        email: true,
+      },
+      autoVerify: {
+        email: true,
+      },
+      standardAttributes: {
+        email: {
+          required: true,
+          mutable: true,
+        },
+      },
+      removalPolicy: cdk.RemovalPolicy.DESTROY, // Use RETAIN in production
+    });
+
+    const userPoolClient = new congnito.UserPoolClient(this, 'UserPoolClient', {
+      userPool,
+      generateSecret: false, // Set to true for server-side applications
+      authFlows: {
+        userPassword: true,
+        userSrp: true, // Secure Remote Password (SRP) flow
+      },
+      accessTokenValidity: cdk.Duration.hours(1),
+      idTokenValidity: cdk.Duration.hours(1),
+      refreshTokenValidity: cdk.Duration.days(30),
+    })
 
     // SNS Topic for WebSocket Notifications
     const notificationTopic = new sns.Topic(this, 'WebSocketNotificationTopic', {
@@ -24,11 +55,32 @@ export class WebSocketNotificationService extends cdk.Stack {
 
     const connectionTable = new dynamodb.Table(this, 'ConnectionTable', {
       partitionKey: { name: 'connectionId', type: dynamodb.AttributeType.STRING },
+      removalPolicy: cdk.RemovalPolicy.DESTROY, // Use RETAIN in production
     });
+
+    /*const authorizerFunction = new lambda.Function(this, 'AuthorizerFunction', {
+      runtime: lambda.Runtime.NODEJS_22_X,
+      handler: 'index.handler',
+      code: lambda.Code.fromAsset('../authorizer'),
+      environment: {
+        CONNECTION_TABLE: connectionTable.tableName,
+        USER_POOL_ID: userPool.userPoolId,
+        USER_POOL_CLIENT_ID: userPoolClient.userPoolClientId,
+        AWS_REGION: cdk.Aws.REGION,
+      },
+      timeout: cdk.Duration.seconds(30),
+    });
+
+    const customAuthorizer = new apigateway.TokenAuthorizer(this, 'WebSocketAuthorizer', {
+      handler: authorizerFunction,
+      resultsCacheTtl: cdk.Duration.minutes(5),
+    });
+
+    connectionTable.grantReadData(authorizerFunction);*/
 
     // Add GSI for querying by userId and projectId
     connectionTable.addGlobalSecondaryIndex({
-      indexName: 'UserProjectIndex',
+      indexName: 'ProjectUserIndex',
       partitionKey: {
         name: 'projectId',
         type: dynamodb.AttributeType.STRING,
@@ -52,15 +104,15 @@ export class WebSocketNotificationService extends cdk.Stack {
       },
     });
 
-    connectionTable.grantReadWriteData(connectionHandler);
+    connectionTable.grantWriteData(connectionHandler);
 
     const LambdaIntegration = new integrations.WebSocketLambdaIntegration(
       'ConnectionHandlerIntegration',
        connectionHandler
     );
 
-    // build-in routes for WebSocket API. Triggered automatically when a client connects or disconnects.
-    webSocketApi.addRoute('$connect', { 
+    // TODO: build websocket authorizer (https://loginov-rocks.medium.com/authorize-access-to-websocket-api-gateway-with-cognito-d7c0d35e7e89)
+      webSocketApi.addRoute('$connect', { 
       integration: LambdaIntegration,
     });
     
@@ -101,49 +153,7 @@ export class WebSocketNotificationService extends cdk.Stack {
     const publishHandler = new lambda.Function(this, 'PublishHandler', {
       runtime: lambda.Runtime.NODEJS_22_X,
       handler: 'index.handler',
-      code: lambda.Code.fromInline(`
-        const { SNSClient, PublishCommand } = require('@aws-sdk/client-sns');
-        const sns = new SNSClient({});
-        
-        exports.handler = async (event) => {
-          
-          try {
-            const message = event.body || 'Default message because no body was provided';
-            
-            const command = new PublishCommand({
-              TopicArn: process.env.TOPIC_ARN,
-              Message: message,
-            });
-            
-            const result = await sns.send(command);
-            
-            return {
-              statusCode: 200,
-              headers: {
-                'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*',
-              },
-              body: JSON.stringify({
-                message: 'Message sent successfully!',
-                messageId: result.MessageId
-              })
-            };
-            
-          } catch (error) {
-            return {
-              statusCode: 500,
-              headers: {
-                'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*',
-              },
-              body: JSON.stringify({
-                error: 'Failed to send message',
-                details: error.message
-              })
-            };
-          }
-        };
-      `),
+      code: lambda.Code.fromAsset('../publisher'),
       environment: {
       TOPIC_ARN: notificationTopic.topicArn,
       },
@@ -153,7 +163,12 @@ export class WebSocketNotificationService extends cdk.Stack {
     
     const publishIntegration = new apigateway.LambdaIntegration(publishHandler);
     publishResource.addMethod('POST', publishIntegration);
-
+    
+    /*publishResource.addMethod('POST', publishIntegration, {
+      // to check if the user is authenticated and authorized to publish messages (userId part of project)
+      authorizer: customAuthorizer,
+      authorizationType: apigateway.AuthorizationType.CUSTOM,
+    });*/
 
     // receives SNS notifications and processes them
     const processorLambda = new lambda.Function(this, 'ProcessorLambda', {
