@@ -3,34 +3,25 @@ const dynamoDB = new AWS.DynamoDB.DocumentClient();
 
 exports.handler = async (event) => {
   try {
-   
+  console.log('Received event:', JSON.stringify(event, null, 2));
   const connectionId = event.requestContext.connectionId;
-  const { projectId, userId } = event.queryStringParameters || {};
-  
-  /*const userId = event.requestContext.authorizer?.userId || "";
-
-  if (!userId) {
-    return {
-      statusCode: 401,
-      body: 'Unauthorized',
-    };
-  }*/
+  const { userId, chatId } = event.requestContext.authorizer || {};
 
   const tableName = process.env.CONNECTION_TABLE;
 
   switch (event.requestContext.routeKey) {
     case '$connect':
-      if (!projectId || !userId) {
+      if (!chatId || !userId) {
         return {
           statusCode: 400,
-          body: 'userId and projectId are required query parameters',
+          body: 'userId and chatId are required query parameters',
         };
       }
       const putCommand = dynamoDB.put({
         TableName: tableName,
         Item: { 
           connectionId, 
-          projectId,
+          chatId,
           userId,
         },
       });

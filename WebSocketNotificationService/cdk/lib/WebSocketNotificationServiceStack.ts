@@ -35,10 +35,10 @@ export class WebSocketNotificationService extends cdk.Stack {
 
     const userPoolClient = new congnito.UserPoolClient(this, 'UserPoolClient', {
       userPool,
-      generateSecret: false, // Set to true for server-side applications
+      generateSecret: false,
       authFlows: {
         userPassword: true,
-        userSrp: true, // Secure Remote Password (SRP) flow
+        userSrp: true,
       },
       accessTokenValidity: cdk.Duration.hours(1),
       idTokenValidity: cdk.Duration.hours(1),
@@ -58,31 +58,32 @@ export class WebSocketNotificationService extends cdk.Stack {
       removalPolicy: cdk.RemovalPolicy.DESTROY, // Use RETAIN in production
     });
 
-    /*const authorizerFunction = new lambda.Function(this, 'AuthorizerFunction', {
+    const webSocketAuthFunction = new lambda.Function(this, 'WebSocketAuthorizerFunction', {
       runtime: lambda.Runtime.NODEJS_22_X,
       handler: 'index.handler',
-      code: lambda.Code.fromAsset('../authorizer'),
+      code: lambda.Code.fromAsset('../websocket-authorizer'),
       environment: {
         CONNECTION_TABLE: connectionTable.tableName,
-        USER_POOL_ID: userPool.userPoolId,
         USER_POOL_CLIENT_ID: userPoolClient.userPoolClientId,
-        AWS_REGION: cdk.Aws.REGION,
+        JWKS_URI: `https://cognito-idp.${cdk.Aws.REGION}.amazonaws.com/${userPool.userPoolId}/.well-known/jwks.json`,
       },
-      timeout: cdk.Duration.seconds(30),
+      timeout: cdk.Duration.seconds(10),
     });
 
-    const customAuthorizer = new apigateway.TokenAuthorizer(this, 'WebSocketAuthorizer', {
-      handler: authorizerFunction,
-      resultsCacheTtl: cdk.Duration.minutes(5),
-    });
+    // this is a lambda request authorizer for WebSocket API
+   const websocketLambdaAuthorizer = new cdk.aws_apigatewayv2_authorizers.WebSocketLambdaAuthorizer('WebSocketAuthorizer', webSocketAuthFunction, {
+      authorizerName: 'WebSocketAuthorizer',
+      // Token as query string parameter because of WebSocket Protocol Limitation. Optional todo: Encrypt token
+      identitySource: ['route.request.querystring.token', 'route.request.querystring.chatId'],
+    });    
 
-    connectionTable.grantReadData(authorizerFunction);*/
+    connectionTable.grantReadData(webSocketAuthFunction);
 
-    // Add GSI for querying by userId and projectId
+    // Add GSI for querying by chatId and userId
     connectionTable.addGlobalSecondaryIndex({
-      indexName: 'ProjectUserIndex',
+      indexName: 'ChatUserIndex',
       partitionKey: {
-        name: 'projectId',
+        name: 'chatId',
         type: dynamodb.AttributeType.STRING,
       },
       sortKey: {
@@ -111,9 +112,9 @@ export class WebSocketNotificationService extends cdk.Stack {
        connectionHandler
     );
 
-    // TODO: build websocket authorizer (https://loginov-rocks.medium.com/authorize-access-to-websocket-api-gateway-with-cognito-d7c0d35e7e89)
-      webSocketApi.addRoute('$connect', { 
+    webSocketApi.addRoute('$connect', { 
       integration: LambdaIntegration,
+      authorizer: websocketLambdaAuthorizer,
     });
     
     webSocketApi.addRoute('$disconnect', { 
@@ -141,9 +142,11 @@ export class WebSocketNotificationService extends cdk.Stack {
     // REST Api to publish SNS messages
     const notificationApi = new apigateway.RestApi(this, 'NotificationApi', {
       defaultCorsPreflightOptions: {
-        allowOrigins: apigateway.Cors.ALL_ORIGINS,
-        allowMethods: ['POST'],
-        allowHeaders: apigateway.Cors.DEFAULT_HEADERS,
+        allowOrigins: ['localhost:3000'],
+        allowMethods: ['POST', 'OPTIONS'],
+        allowHeaders: [
+          ...apigateway.Cors.DEFAULT_HEADERS,
+          'Authorization',],
         allowCredentials: true,
       }
     });
@@ -156,19 +159,24 @@ export class WebSocketNotificationService extends cdk.Stack {
       code: lambda.Code.fromAsset('../publisher'),
       environment: {
       TOPIC_ARN: notificationTopic.topicArn,
+      CONNECTION_TABLE: connectionTable.tableName,
       },
     });
 
+    connectionTable.grantReadData(publishHandler);
     notificationTopic.grantPublish(publishHandler);
     
+    const cognitoAuthorizer = new apigateway.CognitoUserPoolsAuthorizer(this, 'CognitoAuthorizer', {
+      cognitoUserPools: [userPool],
+      authorizerName: 'CognitoNotificationApiAuthorizer',
+      identitySource: 'method.request.header.Authorization',
+    });
+
     const publishIntegration = new apigateway.LambdaIntegration(publishHandler);
-    publishResource.addMethod('POST', publishIntegration);
-    
-    /*publishResource.addMethod('POST', publishIntegration, {
-      // to check if the user is authenticated and authorized to publish messages (userId part of project)
-      authorizer: customAuthorizer,
-      authorizationType: apigateway.AuthorizationType.CUSTOM,
-    });*/
+    publishResource.addMethod('POST', publishIntegration, {
+      authorizer: cognitoAuthorizer,
+      authorizationType: apigateway.AuthorizationType.COGNITO,
+    });
 
     // receives SNS notifications and processes them
     const processorLambda = new lambda.Function(this, 'ProcessorLambda', {
@@ -190,6 +198,7 @@ export class WebSocketNotificationService extends cdk.Stack {
       effect: iam.Effect.ALLOW,
       actions: ['execute-api:ManageConnections'],
       resources: [
+        // first * is the stage, second * is the route, third * is the connectionId
         `arn:${cdk.Aws.PARTITION}:execute-api:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:${webSocketApi.apiId}/*/*/@connections/*`
       ],
     }));

@@ -22,33 +22,35 @@ exports.handler = async (event) => {
 
     console.log('message:', message);
     
-    const projectId = event.Records[0].Sns.MessageAttributes.projectId.Value;
+    const chatId = event.Records[0].Sns.MessageAttributes.chatId.Value;
     const userId = event.Records[0].Sns.MessageAttributes.userId.Value;
     const timestamp = event.Records[0].Sns.MessageAttributes.timestamp.Value;
-    console.log(`Received message from userId: ${userId} for projectId: ${projectId}, timestamp: ${timestamp}`);
+    console.log(`Received message from userId: ${userId} for chatId: ${chatId}, timestamp: ${timestamp}`);
 
-    if (!projectId || !userId) {
-      console.error('Missing projectId or userId in SNS message attributes');
+    if (!chatId || !userId) {
+      console.error('Missing chatId or userId in SNS message attributes');
       return;
     }
 
-    // Get all connections for this project to send targeted notifications
+    // Get all connections for this chat to send targeted notifications
     const queryCommand = new QueryCommand({
       TableName: process.env.CONNECTION_TABLE,
-      IndexName: 'ProjectUserIndex',
-      KeyConditionExpression: 'projectId = :projectId',
+      IndexName: 'ChatUserIndex',
+      KeyConditionExpression: 'chatId = :chatId',
       ExpressionAttributeValues: {
-        ':projectId': projectId,
+        ':chatId': chatId,
       },
     });
             
     const connections = await dynamoDB.send(queryCommand);
     const connectionCount = connections.Items?.length || 0;
             
-    console.log(`Found ${connectionCount} connections for project ${projectId}`);
+    console.log(`Found ${connectionCount} connections for chat ${chatId}`);
         
     if (!connections.Items || connections.Items.length === 0) {
       console.log('No connections found');
+      // Optionally, you could send a message to a dead-letter queue or log this
+      // to handle cases where no connections exist for the chat.
       return;
     }
 
