@@ -74,22 +74,7 @@ export class WebSocketNotificationService extends cdk.Stack {
    const websocketLambdaAuthorizer = new cdk.aws_apigatewayv2_authorizers.WebSocketLambdaAuthorizer('WebSocketAuthorizer', webSocketAuthFunction, {
       authorizerName: 'WebSocketAuthorizer',
       // Token as query string parameter because of WebSocket Protocol Limitation. Optional todo: Encrypt token
-      identitySource: ['route.request.querystring.token', 'route.request.querystring.chatId'],
-    });    
-
-    connectionTable.grantReadData(webSocketAuthFunction);
-
-    // Add GSI for querying by chatId and userId
-    connectionTable.addGlobalSecondaryIndex({
-      indexName: 'ChatUserIndex',
-      partitionKey: {
-        name: 'chatId',
-        type: dynamodb.AttributeType.STRING,
-      },
-      sortKey: {
-        name: 'userId',
-        type: dynamodb.AttributeType.STRING,
-      },
+      identitySource: ['route.request.querystring.token'],
     });
 
     // WebSocket API for real-time notifications
@@ -97,11 +82,19 @@ export class WebSocketNotificationService extends cdk.Stack {
 
     // lambda function to handle WebSocket connections
     const connectionHandler = new lambda.Function(this, 'ConnectionHandler', {
-      runtime: lambda.Runtime.NODEJS_18_X,
+      runtime: lambda.Runtime.NODEJS_22_X,
       handler: 'index.handler',
       code: lambda.Code.fromAsset('../connection-handler'),
       environment: {
         CONNECTION_TABLE: connectionTable.tableName,
+      },
+    });
+
+    connectionTable.addGlobalSecondaryIndex({
+      indexName: 'UserIndex',
+      partitionKey: {
+        name: 'userId',
+        type: dynamodb.AttributeType.STRING,
       },
     });
 

@@ -1,46 +1,59 @@
 const { SNSClient, PublishCommand } = require('@aws-sdk/client-sns');
 const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
-const { DynamoDBDocumentClient, QueryCommand } = require('@aws-sdk/lib-dynamodb');
+const { DynamoDBDocumentClient, QueryCommand, ScanCommand } = require('@aws-sdk/lib-dynamodb');
 
 const dynamoClient = new DynamoDBClient({});
 const dynamoDB = DynamoDBDocumentClient.from(dynamoClient);
 const sns = new SNSClient({});
 
-async function checkChatAccess(userId, chatId) {
-    // todo: optionally check access using cognito claim to check if user is part of chat
-    // then differentiate between access to chat 403 and connections (not) found 404
-    const userIdString = String(userId);
-    const chatIdString = String(chatId);
-    try {
+async function checkConnectionAvailability(targetClass, targetId) 
+{
+    const targetAttribute = targetClass === "org" ? "orgId" : targetClass === "hub" ? "hubId" : "userId";
+    try {    
+        // For user, check user existence
+        if (targetClass === "user") {
+            const queryCommand = new QueryCommand({
+                TableName: process.env.CONNECTION_TABLE,
+                IndexName: 'UserIndex',
+                KeyConditionExpression: "#targetAttribute = :targetId",
+                ExpressionAttributeValues: {
+                    ':targetId': targetId
+                },
+                ExpressionAttributeNames: {
+                    '#targetAttribute': targetAttribute,
+                },
+                Select: 'COUNT',
+            });
+                
+            const result = await dynamoDB.send(queryCommand);
+            return result.Count > 0;
+        }
         
-        const queryCommand = new QueryCommand({
+        // For hub/org, check that at least one connection exists
+        // todo: think about creation of global secondary index for orgId and hubId
+        const scanCommand = new ScanCommand({
             TableName: process.env.CONNECTION_TABLE,
-            IndexName: 'ChatUserIndex',
-            KeyConditionExpression: 'chatId = :chatId AND userId = :userId',
+            FilterExpression: `#targetAttribute = :targetId`,
             ExpressionAttributeValues: {
-                ':chatId': chatIdString,
-                ':userId': userIdString,
+                ':targetId': targetId
             },
-            Limit: 1,
+            ExpressionAttributeNames: {
+                '#targetAttribute': targetAttribute,
+            },
+            Select: 'COUNT',
         });
-    const result = await dynamoDB.send(queryCommand);
-    
-    console.log('Query result:', JSON.stringify(result, null, 2));
-    
-    const hasAccess = !!(result.Items && result.Items.length > 0);
-
-    // if no connections found, against the logic of reliable messaging!!!
-    console.log(`User ${userIdString} has access to chat ${chatIdString}:`, hasAccess);
-     
-    return hasAccess;
-  } catch (error) {
-        console.error('checkChatAccess failed:', {
+        
+        const result = await dynamoDB.send(scanCommand);
+        console.log(`Found ${result.Count} connections for targetClass ${targetClass} with targetId ${targetId}`);
+        return result.Count > 0;     
+    } catch (error) {
+        console.error('checkConnectionAvailability failed:', {
             error: error.message,
             stack: error.stack,
-            userId: userIdString,
-            chatId: chatIdString
+            targetClass: targetClass,
+            targetId: targetId
         });
-    return false;
+        return false;
   }
 }
 
@@ -48,11 +61,14 @@ exports.handler = async (event) => {
     try {
         console.log('Received event:', JSON.stringify(event, null, 2));
 
-        const userId = event.requestContext.authorizer.claims.sub;
-        const chatId = event.queryStringParameters?.chatId;
+        const cognitoUserId = event.requestContext.authorizer.claims.sub;
 
-        if (!userId || !chatId) {
-            console.error('Missing userId or chatId in request');
+        let messageBody;
+        try {
+            messageBody = JSON.parse(event.body || '{}');
+        } 
+        catch (e) {
+            console.log('Error while parsing body:', e);
             return {
                 statusCode: 400,
                 headers: {
@@ -60,48 +76,59 @@ exports.handler = async (event) => {
                     'Access-Control-Allow-Origin': '*',
                 },
                 body: JSON.stringify({
-                    error: 'Missing chatId in request as query parameter',
+                    error: 'Request body not json',
                 }),
             };
         }
-            
-        console.log(`Publishing message for user ${userId} in chat ${chatId}`);
 
-        const authorized = await checkChatAccess(userId, chatId);
-        if(!authorized) {
+        const { TargetClass, TargetId, Subject, Data } = messageBody;
+
+        if (!TargetClass || !TargetId || !Subject || !Data ) {
+            console.error('Missing parameter in body.');
             return {
-                statusCode: 403,
+                statusCode: 400,
                 headers: {
                     'Content-Type': 'application/json',
                     'Access-Control-Allow-Origin': '*',
                 },
                 body: JSON.stringify({
-                    error: 'User not authorized for this chat or no connections found',
+                    error: 'Missing parameter in body.',
                 }),
             };
         }
-        
-        let messageBody;
-        let isJson = true;
-        try {
-            messageBody = JSON.parse(event.body || '{}');
-        } 
-        catch (e) {
-            isJson = false;
-            messageBody = event.body || 'Default message';
-        }
             
+        console.log(`Publishing message for cognito user ${cognitoUserId} with target ${TargetId} in targetclass ${TargetClass}`);
+
+        // todo: optionally check if cognito user is allowed to publish to this target
+        const authorized = await checkConnectionAvailability(TargetClass, TargetId);
+        if(!authorized) {
+            return {
+                statusCode: 404,
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*',
+                },
+                body: JSON.stringify({
+                    error: `No available target "${TargetId}" for targetClass "${TargetClass}" found`,
+                }),
+            };
+        }
+           
         const command = new PublishCommand({
             TopicArn: process.env.TOPIC_ARN,
-            Message: isJson ? messageBody.message : messageBody,
+            Message: JSON.stringify(Data),
             MessageAttributes: {
-                chatId: {
+                TargetClass: {
                   DataType: 'String',
-                  StringValue: chatId,
+                  StringValue: TargetClass,
                 },
-                userId: {
-                  DataType: 'String',
-                  StringValue: userId,
+                TargetId: {
+                    DataType: 'String',
+                    StringValue: TargetId,
+                },
+                Subject: {
+                    DataType: 'String',
+                    StringValue: Subject,
                 },
                 timestamp: {
                   DataType: 'String',
@@ -110,10 +137,6 @@ exports.handler = async (event) => {
             },
         });
 
-        if (isJson) {
-            command.MessageAttributes.messageType = messageBody.messageType || "info";
-        }
-            
         const result = await sns.send(command);
 
         console.log('Message published successfully:', result);
@@ -127,7 +150,6 @@ exports.handler = async (event) => {
             body: JSON.stringify({
                message: 'Message sent successfully!',
                messageId: result.MessageId,
-               chatId: chatId,
             })
         };    
     } catch (error) {

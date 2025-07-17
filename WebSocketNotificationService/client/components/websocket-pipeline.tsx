@@ -25,9 +25,10 @@ interface Pipeline {
 interface WebSocketPipelineProps {
   pipeline: Pipeline
   onRemove: () => void
+  accessToken?: string
 }
 
-export default function WebSocketPipeline({ pipeline, onRemove }: WebSocketPipelineProps) {
+export default function WebSocketPipeline({ pipeline, onRemove, accessToken }: WebSocketPipelineProps) {
   const [messages, setMessages] = useState<Message[]>([])
   const [status, setStatus] = useState<ConnectionStatus>("disconnected")
   const [isPaused, setIsPaused] = useState(false)
@@ -37,7 +38,7 @@ export default function WebSocketPipeline({ pipeline, onRemove }: WebSocketPipel
   const maxReconnectAttempts = 5
 
   const socketRef = useRef<WebSocket | null>(null)
-  const terminalRef = useRef<HTMLDivElement>(null)
+  const terminalRef = useRef<HTMLDivElement | null>(null)
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null)
 
   const addMessage = (content: string, type: Message["type"] = "data") => {
@@ -84,18 +85,41 @@ export default function WebSocketPipeline({ pipeline, onRemove }: WebSocketPipel
       setStatus("connecting")
       addMessage(`[${formatTimestamp(new Date())}] 🔌 Connecting to ${pipeline.url}...`, "system")
 
-      const socket = new WebSocket(pipeline.url)
+      if (accessToken) {
+        addMessage(`[${formatTimestamp(new Date())}] 🔐 Using authenticated connection`, "system")
+      }
+
+      // Create WebSocket URL with auth token if available
+      let wsUrl = pipeline.url
+      if (accessToken && pipeline.url.includes("?")) {
+        wsUrl += `&token=${accessToken}`
+      } else if (accessToken) {
+        wsUrl += `?token=${accessToken}`
+      }
+
+      const socket = new WebSocket(wsUrl)
+
+      // Set a connection timeout
+      const connectionTimeout = setTimeout(() => {
+        if (socket.readyState === WebSocket.CONNECTING) {
+          socket.close()
+          setStatus("error")
+          addMessage(`[${formatTimestamp(new Date())}] ❌ Connection timeout to ${pipeline.url}`, "error")
+          addMessage(`[${formatTimestamp(new Date())}] Server may not be running or URL is incorrect`, "system")
+        }
+      }, 10000) // 10 second timeout
 
       socket.onopen = () => {
+        clearTimeout(connectionTimeout)
         setStatus("connected")
         setReconnectAttempts(0)
         addMessage(`[${formatTimestamp(new Date())}] ✅ Connected to ${pipeline.url}`, "success")
       }
 
-      socket.onmessage = (event) => {
+      socket.onmessage = (ev) => {
         try {
           const timestamp = formatTimestamp(new Date())
-          let message = event.data
+          let message = ev.data
 
           // Try to parse JSON for better formatting
           try {
@@ -112,14 +136,24 @@ export default function WebSocketPipeline({ pipeline, onRemove }: WebSocketPipel
       }
 
       socket.onclose = (event) => {
+        clearTimeout(connectionTimeout)
         setStatus("disconnected")
         const reason = event.reason || "Connection closed"
         const code = event.code
-        addMessage(`[${formatTimestamp(new Date())}] ❌ Disconnected (Code: ${code}, Reason: ${reason})`, "error")
 
-        // Auto-reconnect logic
-        if (autoReconnect && reconnectAttempts < maxReconnectAttempts && !event.wasClean) {
-          const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000)
+        if (code === 1006) {
+          addMessage(`[${formatTimestamp(new Date())}] ❌ Connection failed - Server not reachable`, "error")
+          addMessage(
+            `[${formatTimestamp(new Date())}] Make sure WebSocket server is running on ${pipeline.url}`,
+            "system",
+          )
+        } else {
+          addMessage(`[${formatTimestamp(new Date())}] ❌ Disconnected (Code: ${code}, Reason: ${reason})`, "error")
+        }
+
+        // Auto-reconnect logic (only for unexpected disconnections)
+        if (autoReconnect && reconnectAttempts < maxReconnectAttempts && !event.wasClean && code !== 1006) {
+          const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000) // Exponential backoff, max 30s
           setReconnectAttempts((prev) => prev + 1)
           addMessage(
             `[${formatTimestamp(new Date())}] 🔄 Reconnecting in ${delay / 1000}s... (${reconnectAttempts + 1}/${maxReconnectAttempts})`,
@@ -133,16 +167,15 @@ export default function WebSocketPipeline({ pipeline, onRemove }: WebSocketPipel
       }
 
       socket.onerror = (error) => {
+        clearTimeout(connectionTimeout)
         setStatus("error")
-        console.error("WebSocket error details:", error)
-        addMessage(`[${formatTimestamp(new Date())}] ❌ Connection failed to ${pipeline.url}`, "error")
-        addMessage(`[${formatTimestamp(new Date())}] 💡 Make sure your WebSocket server is running`, "system")
+        addMessage(`[${formatTimestamp(new Date())}] ❌ Connection error: Cannot connect to ${pipeline.url}`, "error")
       }
 
       socketRef.current = socket
     } catch (error) {
       setStatus("error")
-      addMessage(`[${formatTimestamp(new Date())}] ❌ Connection error: ${error}`, "error")
+      addMessage(`[${formatTimestamp(new Date())}] ❌ Failed to create WebSocket: ${error}`, "error")
       console.error("Failed to create WebSocket:", error)
     }
   }
@@ -186,11 +219,14 @@ export default function WebSocketPipeline({ pipeline, onRemove }: WebSocketPipel
     }
   }, [messages, isPaused])
 
-  // Auto-connect on mount
+  // Add initial message
   useEffect(() => {
-    connect()
+    addMessage(`[${formatTimestamp(new Date())}] Pipeline "${pipeline.name}" created`, "system")
+    addMessage(`[${formatTimestamp(new Date())}] Click "Connect" to start WebSocket connection`, "system")
+    if (accessToken) {
+      addMessage(`[${formatTimestamp(new Date())}] Authentication token available for secure connections`, "system")
+    }
 
-    // Cleanup on unmount
     return () => {
       disconnect()
     }
@@ -232,7 +268,14 @@ export default function WebSocketPipeline({ pipeline, onRemove }: WebSocketPipel
     <Card>
       <CardHeader className="pb-3">
         <div className="flex items-center justify-between">
-          <CardTitle className="text-lg">{pipeline.name}</CardTitle>
+          <CardTitle className="text-lg flex items-center gap-2">
+            {pipeline.name}
+            {accessToken && (
+              <Badge variant="outline" className="text-xs">
+                Auth
+              </Badge>
+            )}
+          </CardTitle>
           <Button variant="ghost" size="sm" onClick={handleRemove} className="text-red-500 hover:text-red-700">
             <XIcon className="h-4 w-4" />
           </Button>
@@ -294,7 +337,7 @@ export default function WebSocketPipeline({ pipeline, onRemove }: WebSocketPipel
           ))}
           {isPaused && queuedMessages.length > 0 && (
             <div className="text-yellow-400 mt-2 border-t border-yellow-800 pt-2">
-              📦 {queuedMessages.length} new message{queuedMessages.length !== 1 ? "s" : ""} queued. Click Resume to
+              {queuedMessages.length} new message{queuedMessages.length !== 1 ? "s" : ""} queued. Click Resume to
               view.
             </div>
           )}

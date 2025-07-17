@@ -1,8 +1,6 @@
-// const {DynamoDBClient, QueryCommand} = require('@aws-sdk/client-dynamodb');
 const { URL } = require('url');
 const { createRemoteJWKSet, jwtVerify } = require('jose');
 
-// const ddb = new DynamoDBClient();
 let jwksClient;
 
 async function getJwksClient() {
@@ -27,7 +25,7 @@ async function verifyToken(token) {
     } catch (audError) {
       console.log('Audience validation failed, trying without audience (likely access token):', audError.message);
       
-      // Try without audience (for ID tokens)
+      // Try without audience (for access token)
       const { payload } = await jwtVerify(token, jwks, {
         issuer: process.env.JWKS_URI.replace('/.well-known/jwks.json', ''),
       });
@@ -39,44 +37,17 @@ async function verifyToken(token) {
   }
 }
 
-async function checkChatAccess(userId, chatId) {
-  try {
-    // todo: implement. Use cognito claim to check if user is part of chat
-
-    /*const queryCommand = new QueryCommand({
-      TableName: process.env.CONNECTION_TABLE,
-      IndexName: 'ChatUserIndex',
-      KeyConditionExpression: 'chatId = :chatId AND userId = :userId',
-      ExpressionAttributeValues: {
-        ':chatId': chatId,
-        ':userId': userId,
-      },
-      Limit: 1,
-    });
-    
-    const result = await ddb.send(queryCommand);
-        
-    if (!result.Items || result.Items.length === 0) {
-      throw new Error(`User ${userId} not authorized for chat ${chatId}`);
-    }
-     
-    return !!result.Items.length;*/
-    return true;
-  } catch (error) {
-    console.error('checkChatAccess failed', error);
-    throw error;
-  }
-}
-
 exports.handler = async (event, context) => {
   console.log('Received event:', JSON.stringify(event, null, 2));
   console.log('Context:', JSON.stringify(context, null, 2));
   
   const token = event.queryStringParameters?.token;
-  const chatId = event.queryStringParameters?.chatId;
+  const hubId = event.queryStringParameters?.hubId;
+  const orgId = event.queryStringParameters?.orgId;
+  const userId = event.queryStringParameters?.userId;
 
-  if (!token || !chatId) {
-    console.log('Missing token or chatId query parameter');
+  if (!token || !hubId || !orgId || !userId) {
+    console.log('Missing one or more of the required query parameters: token, hubId, orgId, userId');
     generateDeny('user', event.methodArn);
   }
 
@@ -87,19 +58,18 @@ exports.handler = async (event, context) => {
       generateDeny('user', event.methodArn);
     }
 
-    const userId = decodedToken.sub;
+    const cognitoUserId = decodedToken.sub;
 
-    const hasAccess = await checkChatAccess(userId, chatId);
-
-    console.log(`Decoded token for user ${userId}:`, JSON.stringify(decodedToken, null, 2));
-    console.log(`User ${userId} has access to chat ${chatId}: ${hasAccess}`);
+    console.log(`Decoded token for cognito user ${cognitoUserId}:`, JSON.stringify(decodedToken, null, 2));
     const context = {
+        cognitoUserId: cognitoUserId,
         userId: userId,
-        chatId: chatId,
+        hubId: hubId,
+        orgId: orgId,
         username: decodedToken['cognito:username'] || decodedToken.username
     }
 
-    return hasAccess ? generateAllow(userId, event.methodArn, context) : generateDeny(userId, event.methodArn);
+    return generateAllow(cognitoUserId, event.methodArn, context);
   } catch (error) {
     console.error('Authorization error:', error);
     return generateDeny('user', event.methodArn);

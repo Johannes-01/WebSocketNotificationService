@@ -8,6 +8,7 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { PlusIcon, SendIcon } from "lucide-react"
+import { useAuth } from "@/components/auth/cognito-auth"
 import WebSocketPipeline from "./websocket-pipeline"
 
 interface Pipeline {
@@ -17,10 +18,11 @@ interface Pipeline {
 }
 
 export default function MultiWebSocketClient() {
+  const { user } = useAuth()
   const [pipelines, setPipelines] = useState<Pipeline[]>([])
-  const [newPipelineUrl, setNewPipelineUrl] = useState("ws://localhost:8080")
+  const [newPipelineUrl, setNewPipelineUrl] = useState("wss://echo.websocket.org/")
   const [newPipelineName, setNewPipelineName] = useState("")
-  const [httpApiUrl, setHttpApiUrl] = useState("http://localhost:3001/api/message")
+  const [httpApiUrl, setHttpApiUrl] = useState("https://httpbin.org/post")
   const [messageText, setMessageText] = useState("")
   const [isLoading, setIsLoading] = useState(false)
   const [httpResponse, setHttpResponse] = useState("")
@@ -36,7 +38,7 @@ export default function MultiWebSocketClient() {
 
     setPipelines((prev) => [...prev, pipeline])
     setNewPipelineName("")
-    setNewPipelineUrl("ws://localhost:8080")
+    setNewPipelineUrl("wss://echo.websocket.org/")
   }
 
   const removePipeline = (id: string) => {
@@ -50,16 +52,26 @@ export default function MultiWebSocketClient() {
     setHttpResponse("")
 
     try {
-        console.log("Sending message to HTTP API:", httpApiUrl, messageText)
+      const headers: Record<string, string> = {
+        "Connection": "keep-alive",
+        "Accept": "*/*",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Content-Type": "application/json",
+      }
+
+      // Add Authorization header if user is authenticated
+      if (user?.idToken) {
+        headers.Authorization = `Bearer ${user.idToken}`
+      }
+
       const response = await fetch(httpApiUrl, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: messageText,
+        headers,
+        body: messageText
       })
+      console.log("HTTP Response:", response)
 
-      const responseText = await response.text()
+      const responseText = await response.text();
       let formattedResponse = ""
 
       if (response.ok) {
@@ -90,6 +102,7 @@ export default function MultiWebSocketClient() {
           <CardTitle className="flex items-center gap-2">
             <SendIcon className="h-5 w-5" />
             HTTP API Messenger
+            {user?.accessToken && <span className="text-sm font-normal text-green-600">(Authenticated)</span>}
           </CardTitle>
         </CardHeader>
         <CardContent className="space-y-4">
@@ -100,7 +113,7 @@ export default function MultiWebSocketClient() {
                 id="http-api-url"
                 value={httpApiUrl}
                 onChange={(e) => setHttpApiUrl(e.target.value)}
-                placeholder="http://localhost:3001/publish"
+                placeholder="https://httpbin.org/post"
               />
             </div>
             <div>
@@ -118,13 +131,17 @@ export default function MultiWebSocketClient() {
                   {isLoading ? "Sending..." : "Send"}
                 </Button>
               </div>
-              <p className="text-xs text-gray-500 mt-1">Press Ctrl+Enter to send</p>
+              <p className="text-xs text-gray-500 mt-1">
+                Press Ctrl+Enter to send {user?.idToken && "• Authorization header included"}
+              </p>
             </div>
           </div>
           {httpResponse && (
             <div className="mt-4">
               <Label>Response</Label>
-              <div className="bg-gray-100 p-3 rounded-md font-mono text-sm whitespace-pre-wrap">{httpResponse}</div>
+              <div className="bg-gray-100 p-3 rounded-md font-mono text-sm whitespace-pre-wrap max-h-64 overflow-auto">
+                {httpResponse}
+              </div>
             </div>
           )}
         </CardContent>
@@ -152,7 +169,7 @@ export default function MultiWebSocketClient() {
                 id="pipeline-url"
                 value={newPipelineUrl}
                 onChange={(e) => setNewPipelineUrl(e.target.value)}
-                placeholder="ws://localhost:8080"
+                placeholder="wss://echo.websocket.org/"
               />
             </div>
             <div className="flex items-end">
@@ -175,7 +192,12 @@ export default function MultiWebSocketClient() {
           </Card>
         ) : (
           pipelines.map((pipeline) => (
-            <WebSocketPipeline key={pipeline.id} pipeline={pipeline} onRemove={() => removePipeline(pipeline.id)} />
+            <WebSocketPipeline
+              key={pipeline.id}
+              pipeline={pipeline}
+              onRemove={() => removePipeline(pipeline.id)}
+              accessToken={user?.accessToken}
+            />
           ))
         )}
       </div>
