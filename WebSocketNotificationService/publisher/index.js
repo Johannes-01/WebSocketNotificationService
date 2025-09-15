@@ -30,10 +30,11 @@ async function checkConnectionAvailability(targetClass, targetId)
         }
         
         // For hub/org, check that at least one connection exists
-        // todo: think about creation of global secondary index for orgId and hubId
-        const scanCommand = new ScanCommand({
+        const indexName = targetClass === "org" ? "OrgIndex" : "HubIndex";
+        const queryCommand = new QueryCommand({
             TableName: process.env.CONNECTION_TABLE,
-            FilterExpression: `#targetAttribute = :targetId`,
+            IndexName: indexName,
+            KeyConditionExpression: "#targetAttribute = :targetId",
             ExpressionAttributeValues: {
                 ':targetId': targetId
             },
@@ -42,8 +43,8 @@ async function checkConnectionAvailability(targetClass, targetId)
             },
             Select: 'COUNT',
         });
-        
-        const result = await dynamoDB.send(scanCommand);
+
+        const result = await dynamoDB.send(queryCommand);
         console.log(`Found ${result.Count} connections for targetClass ${targetClass} with targetId ${targetId}`);
         return result.Count > 0;     
     } catch (error) {
@@ -114,9 +115,16 @@ exports.handler = async (event) => {
             };
         }
            
+        const publishTimestamp = new Date().toISOString();
+
+        const messageToPublish = {
+            ...Data,
+            publishTimestamp: publishTimestamp,
+        };
+
         const command = new PublishCommand({
             TopicArn: process.env.TOPIC_ARN,
-            Message: JSON.stringify(Data),
+            Message: JSON.stringify(messageToPublish),
             MessageAttributes: {
                 TargetClass: {
                   DataType: 'String',
@@ -132,7 +140,7 @@ exports.handler = async (event) => {
                 },
                 timestamp: {
                   DataType: 'String',
-                  StringValue: new Date().toISOString(),
+                  StringValue: publishTimestamp,
                 }
             },
         });

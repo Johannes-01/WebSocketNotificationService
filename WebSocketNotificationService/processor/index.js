@@ -33,15 +33,40 @@ exports.handler = async (event) => {
       return;
     }
 
+    const VALIDITY_WINDOW_MILLISECONDS = 10000; // 10 seconds
+
     let message;
     try {
       const originalMessage = JSON.parse(snsRecord.Message);
+      const publishTimestamp = originalMessage.publishTimestamp;
+
+      if (publishTimestamp) {
+        const messageTime = new Date(publishTimestamp).getTime();
+        
+        const latency = (Date.now() - messageTime);
+
+        console.log(JSON.stringify({
+                          event_type: 'latency_measurement',
+                          latency_seconds: parseFloat(latency.toFixed(5)),
+                          message_id: snsRecord.MessageId,
+                          timestamp: new Date().toISOString(),
+                          publish_timestamp: publishTimestamp
+                      }));
+
+        if (latency > VALIDITY_WINDOW_MILLISECONDS) {
+          console.warn(`Message expired. Latency (${latency.toFixed(5)}ms) exceeded validity window of ${VALIDITY_WINDOW_MILLISECONDS}ms. Discarding.`);
+          return; // Stop processing
+        }
+      }
+
       message = {
         "Subject": subject,
         "Data": originalMessage,
       };
     } catch (e) {
       console.log('Message cannot be parsed', e);
+      // If we can't parse the message, we can't check its timestamp, so we'll drop it.
+      return;
     }
   
     let command;
@@ -59,14 +84,17 @@ exports.handler = async (event) => {
       });
     } 
     else if (targetClass === "org" || targetClass === "hub") {
-      command = new ScanCommand({
+      const indexName = targetClass === "org" ? 'OrgIndex' : 'HubIndex';
+      const attributeName = targetClass === "org" ? 'orgId' : 'hubId';
+      command = new QueryCommand({
         TableName: process.env.CONNECTION_TABLE,
-        FilterExpression: "#targetAttribute = :targetId",
+        IndexName: indexName,
+        KeyConditionExpression: "#targetAttribute = :targetId",
         ExpressionAttributeValues: {
           ':targetId': targetId,
         },
         ExpressionAttributeNames: {
-          '#targetAttribute': targetClass === "org" ? 'orgId' : 'hubId',
+          '#targetAttribute': attributeName,
         },
       });
     } else {

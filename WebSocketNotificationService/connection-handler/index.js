@@ -34,10 +34,9 @@ exports.handler = async (event) => {
       case '$disconnect':
         await dynamoDB.send(new DeleteCommand({ 
           TableName: tableName, Key: { connectionId } 
-        })).promise();
+        }));
         return { statusCode: 200, body: 'Disconnected successfully' };
-    }
-
+      }
     return { statusCode: 404, body: 'Route not found'}; 
   } catch (error) {
     console.error('Error in connection handler:', error);
