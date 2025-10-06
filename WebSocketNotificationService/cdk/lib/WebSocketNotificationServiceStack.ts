@@ -13,10 +13,14 @@ import { Construct } from 'constructs';
 import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
 import * as cloudwatch_actions from 'aws-cdk-lib/aws-cloudwatch-actions';
 import * as logs from 'aws-cdk-lib/aws-logs';
+import { SqsEventSource } from 'aws-cdk-lib/aws-lambda-event-sources';
 
 export class WebSocketNotificationService extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
+
+    const stackName = process.env.STACK_NAME || 'WebSocketNotificationServiceStack';
+    this.node.setContext('stackName', stackName);
 
     const userPool = new congnito.UserPool(this, 'UserPool', {
       userPoolName: 'websocket-user-pool',
@@ -40,20 +44,52 @@ export class WebSocketNotificationService extends cdk.Stack {
       userPool,
       generateSecret: false,
       authFlows: {
-        userPassword: true,
+        userSrp: true,        // Enable Secure Remote Password protocol
+        userPassword: true,    // Keep this for backward compatibility
       },
       accessTokenValidity: cdk.Duration.hours(1),
       idTokenValidity: cdk.Duration.hours(1),
       refreshTokenValidity: cdk.Duration.days(30),
     })
 
-    // SNS Topic for WebSocket Notifications
-    const notificationTopic = new sns.Topic(this, 'WebSocketNotificationTopic', {
-      displayName: 'WebSocketNotificationTopic',
+    // for reliable order, higher latency
+    const notificationFifoTopic = new sns.Topic(this, 'NotificationFifoTopic', {
+      displayName: 'NotificationFifoTopic',
+      topicName: `${stackName}-Notifications.fifo`,
+      fifo: true,
+      contentBasedDeduplication: true,
     });
 
+    // standard topic, lower latency
+    const notificationTopic = new sns.Topic(this, 'NotificationTopic', {
+      displayName: 'NotificationTopic',
+      topicName: `${stackName}-Notification`,
+    });
+  
     // optional: DLQ for failed notifications
-    const dlq = new sqs.Queue(this, 'NotificationDLQ');
+    const dlq = new sqs.Queue(this, 'NotificationDLQ', {
+      fifo: true
+    });
+
+    // SQS FIFO Queue to buffer messages for the processor
+    const notificationQueue = new sqs.Queue(this, 'NotificationQueue', {
+      queueName: `${stackName}-NotificationQueue.fifo`,
+      fifo: true,
+      visibilityTimeout: cdk.Duration.seconds(60),
+      deadLetterQueue: {
+        maxReceiveCount: 3,
+        queue: dlq,
+      },
+    });
+
+    // Subscribe the SQS FIFO queue to the SNS FIFO topic
+    notificationFifoTopic.addSubscription(new subscription.SqsSubscription(notificationQueue, {
+      filterPolicy: {
+        targetChannel: sns.SubscriptionFilter.stringFilter({
+          allowlist: ['WebSocket'],
+        }),
+      },
+    }));
 
     const connectionTable = new dynamodb.Table(this, 'ConnectionTable', {
       partitionKey: { name: 'connectionId', type: dynamodb.AttributeType.STRING },
@@ -100,7 +136,7 @@ export class WebSocketNotificationService extends cdk.Stack {
       },
     });
 
-    connectionTable.addGlobalSecondaryIndex({
+    /*connectionTable.addGlobalSecondaryIndex({
       indexName: 'OrgIndex',
       partitionKey: {
         name: 'orgId',
@@ -114,7 +150,7 @@ export class WebSocketNotificationService extends cdk.Stack {
         name: 'hubId',
         type: dynamodb.AttributeType.STRING,
       },
-    });
+    });*/
 
     connectionTable.grantWriteData(connectionHandler);
 
@@ -130,6 +166,26 @@ export class WebSocketNotificationService extends cdk.Stack {
     
     webSocketApi.addRoute('$disconnect', { 
       integration: LambdaIntegration,
+    });
+
+    // P2P via $default route
+    const webSocketMessagePublisher = new lambda.Function(this, 'WebSocketMessagePubisher', {
+      runtime: lambda.Runtime.NODEJS_22_X,
+      handler: 'index.handler',
+      code: lambda.Code.fromAsset('../websocket-message-publisher'),
+      environment: {
+        TOPIC_ARN: notificationFifoTopic.topicArn,
+      },
+      timeout: cdk.Duration.seconds(10),
+    });
+
+    notificationFifoTopic.grantPublish(webSocketMessagePublisher);
+
+    webSocketApi.addRoute('$default', {
+      integration: new integrations.WebSocketLambdaIntegration(
+        'DefaultIntegration',
+        webSocketMessagePublisher
+      ),
     });
 
     webSocketApi.grantManageConnections(connectionHandler);
@@ -150,7 +206,7 @@ export class WebSocketNotificationService extends cdk.Stack {
       value: WebSocketApiStage.url,
     });
 
-    // REST Api to publish SNS messages
+    // Http Api to publish SNS messages
     const notificationApi = new apigateway.RestApi(this, 'NotificationApi', {
       defaultCorsPreflightOptions: {
         allowOrigins: ['localhost:3000'],
@@ -164,18 +220,18 @@ export class WebSocketNotificationService extends cdk.Stack {
 
     const publishResource = notificationApi.root.addResource('publish');
 
-    const publishHandler = new lambda.Function(this, 'PublishHandler', {
+    const HttpPublishHandler = new lambda.Function(this, 'HttpPublishHandler', {
       runtime: lambda.Runtime.NODEJS_22_X,
       handler: 'index.handler',
       code: lambda.Code.fromAsset('../publisher'),
       environment: {
-      TOPIC_ARN: notificationTopic.topicArn,
-      CONNECTION_TABLE: connectionTable.tableName,
+      TOPIC_ARN: notificationFifoTopic.topicArn,
+      /*CONNECTION_TABLE: connectionTable.tableName,*/
       },
     });
 
-    connectionTable.grantReadData(publishHandler);
-    notificationTopic.grantPublish(publishHandler);
+    // connectionTable.grantReadData(HttpPublishHandler);
+    notificationFifoTopic.grantPublish(HttpPublishHandler);
     
     const cognitoAuthorizer = new apigateway.CognitoUserPoolsAuthorizer(this, 'CognitoAuthorizer', {
       cognitoUserPools: [userPool],
@@ -183,8 +239,8 @@ export class WebSocketNotificationService extends cdk.Stack {
       identitySource: 'method.request.header.Authorization',
     });
 
-    const publishIntegration = new apigateway.LambdaIntegration(publishHandler);
-    publishResource.addMethod('POST', publishIntegration, {
+    const HttpPublishIntegration = new apigateway.LambdaIntegration(HttpPublishHandler);
+    publishResource.addMethod('POST', HttpPublishIntegration, {
       authorizer: cognitoAuthorizer,
       authorizationType: apigateway.AuthorizationType.COGNITO,
     });
@@ -203,6 +259,12 @@ export class WebSocketNotificationService extends cdk.Stack {
       reservedConcurrentExecutions: 10,
     });
 
+    // New SQS event source for the processor
+    processorLambda.addEventSource(new SqsEventSource(notificationQueue, {
+      batchSize: 5,
+      reportBatchItemFailures: true,
+    }));
+
     connectionTable.grantReadWriteData(processorLambda);
 
     // Grant permissions to manage WebSocket connections
@@ -213,10 +275,6 @@ export class WebSocketNotificationService extends cdk.Stack {
         // first * is the stage, second * is the route, third * is the connectionId
         `arn:${cdk.Aws.PARTITION}:execute-api:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:${webSocketApi.apiId}/*/*/@connections/*`
       ],
-    }));
-
-    notificationTopic.addSubscription(new subscription.LambdaSubscription(processorLambda, {
-      deadLetterQueue: dlq,
     }));
 
     // CloudWatch Alarm for ProcessorLambda Errors
@@ -299,7 +357,7 @@ export class WebSocketNotificationService extends cdk.Stack {
     });
 
     // Action for the alarms: notify the SNS topic
-    const snsAction = new cloudwatch_actions.SnsAction(notificationTopic);
+    const snsAction = new cloudwatch_actions.SnsAction(notificationFifoTopic);
     processorErrorAlarm.addAlarmAction(snsAction);
     p95LatencyAlarm.addAlarmAction(snsAction);
     averageLatencyAlarm.addAlarmAction(snsAction);
