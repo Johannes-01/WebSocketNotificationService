@@ -1,151 +1,143 @@
 const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
-const { DynamoDBDocumentClient, QueryCommand, DeleteCommand, ScanCommand } = require('@aws-sdk/lib-dynamodb');
+const { DynamoDBDocumentClient, QueryCommand, DeleteCommand } = require('@aws-sdk/lib-dynamodb');
 const { ApiGatewayManagementApiClient, PostToConnectionCommand } = require('@aws-sdk/client-apigatewaymanagementapi');
 
 const dynamoClient = new DynamoDBClient({});
-const dynamoDB = DynamoDBDocumentClient.from(dynamoClient);
+const docClient = DynamoDBDocumentClient.from(dynamoClient);
 
 const apiGateway = new ApiGatewayManagementApiClient({
   endpoint: process.env.WS_API_ENDPOINT,
 });
 
-exports.handler = async (event) => {
-  console.log('Received SNS event:', JSON.stringify(event, null, 2));
+const CONNECTION_TABLE = process.env.CONNECTION_TABLE;
+const VALIDITY_WINDOW_MILLISECONDS = 10000; // 10 seconds
 
-  try {
-    const snsRecord = event.Records[0].Sns;
-    if (!snsRecord || !snsRecord.MessageAttributes) {
-      console.error('Invalid SNS event structure');
-      return;
-    }
+// Processes a single message from the SQS queue
+const processRecord = async (record) => {
+  console.log('Processing SQS record:', record.messageId);
 
-    const messageAttributes = snsRecord.MessageAttributes || {};
-    const targetId = messageAttributes.TargetId?.Value;
-    const targetClass = messageAttributes.TargetClass?.Value;
-    const timestamp = messageAttributes.timestamp?.Value;
-    const subject = messageAttributes.Subject?.Value;
+  // 1. Parse the message body
+  const snsMessage = JSON.parse(record.body);
+  const message = JSON.parse(snsMessage.Message);
 
-    console.log(`Received message for target: ${targetId} with targetClass: ${targetClass}, timestamp: ${timestamp}`);
+  const {
+    TargetClass,
+    payload,
+    publishTimestamp
+  } = message;
 
-    // todo: replace with SNS message filtering.
-    if (!targetClass || !targetId || !subject) {
-      console.error('Missing required SNS message attributes: targetId, targetClass or subject');
-      return;
-    }
-
-    const VALIDITY_WINDOW_MILLISECONDS = 10000; // 10 seconds
-
-    let message;
-    try {
-      const originalMessage = JSON.parse(snsRecord.Message);
-      const publishTimestamp = originalMessage.publishTimestamp;
-
-      if (publishTimestamp) {
-        const messageTime = new Date(publishTimestamp).getTime();
-        
-        const latency = (Date.now() - messageTime);
-
-        console.log(JSON.stringify({
-                          event_type: 'latency_measurement',
-                          latency_seconds: parseFloat(latency.toFixed(5)),
-                          message_id: snsRecord.MessageId,
-                          timestamp: new Date().toISOString(),
-                          publish_timestamp: publishTimestamp
-                      }));
-
-        if (latency > VALIDITY_WINDOW_MILLISECONDS) {
-          console.warn(`Message expired. Latency (${latency.toFixed(5)}ms) exceeded validity window of ${VALIDITY_WINDOW_MILLISECONDS}ms. Discarding.`);
-          return; // Stop processing
-        }
-      }
-
-      message = {
-        "Subject": subject,
-        "Data": originalMessage,
-      };
-    } catch (e) {
-      console.log('Message cannot be parsed', e);
-      // If we can't parse the message, we can't check its timestamp, so we'll drop it.
-      return;
-    }
-  
-    let command;
-    if(targetClass === "user"){
-      command = new QueryCommand({
-        TableName: process.env.CONNECTION_TABLE,
-        IndexName: 'UserIndex',
-        KeyConditionExpression: "#targetAttribute = :targetId",
-        ExpressionAttributeValues: {
-          ':targetId': targetId,
-        },
-        ExpressionAttributeNames: {
-          '#targetAttribute': 'userId',
-        },
-      });
-    } 
-    else if (targetClass === "org" || targetClass === "hub") {
-      const indexName = targetClass === "org" ? 'OrgIndex' : 'HubIndex';
-      const attributeName = targetClass === "org" ? 'orgId' : 'hubId';
-      command = new QueryCommand({
-        TableName: process.env.CONNECTION_TABLE,
-        IndexName: indexName,
-        KeyConditionExpression: "#targetAttribute = :targetId",
-        ExpressionAttributeValues: {
-          ':targetId': targetId,
-        },
-        ExpressionAttributeNames: {
-          '#targetAttribute': attributeName,
-        },
-      });
-    } else {
-      console.error(`Unsupported targetClass: ${targetClass}`);
-      return;
-    }
-            
-    const connections = await dynamoDB.send(command);
-    const connectionCount = connections.Items?.length || 0;
-            
-    console.log(`Found ${connectionCount} connections target ${targetId} in targetClass ${targetClass}`);
-        
-    if (!connections.Items || connections.Items.length === 0) {
-      console.log('No connections found');
-      return;
-    }
-
-    const promises = connections.Items.map(async ({ connectionId }) => {
-      try {
-        console.log(`Sending message to connection: ${connectionId}`);
-        
-        const postCommand = new PostToConnectionCommand({
-          ConnectionId: connectionId,
-          Data: JSON.stringify(message),
-        });
-        
-        await apiGateway.send(postCommand);
-        console.log(`Message sent successfully to ${connectionId}`);
-        
-      } catch (err) {
-        console.error(`Error sending to connection ${connectionId}:`, err.message);
-        
-        // Delete stale connection if it's gone (410 = Gone)
-        if (err.statusCode === 410 || err.$metadata?.httpStatusCode === 410) {
-          console.log(`Deleting stale connection: ${connectionId}`);
-          
-          const deleteCommand = new DeleteCommand({
-            TableName: process.env.CONNECTION_TABLE,
-            Key: { connectionId },
-          });
-          
-          await dynamoDB.send(deleteCommand);
-        }
-      }
-    });
-    
-    await Promise.all(promises);
-    console.log('Finished processing all connections');
-    
-  } catch (error) {
-    console.error('Error processing SNS message:', error);
-    throw error; // Re-throw to trigger retry/DLQ
+  // 2. Validate payload and check message expiration
+  if (!TargetClass || !publishTimestamp || !payload) {
+    console.error('Invalid message structure. Missing required fields.', message);
+    return;
   }
+
+  /**
+ * 
+ {
+    "messageId": "123456",
+    "timestamp": "2025-10-03T14:00:00Z",
+    "targetChannel": "WebSocket",
+    "payload": {
+        "targetId": "abc123xyz",
+        "targetClass": "user", // user, org, hub
+        "eventType": "notification",
+        "content": "Neue Nachricht verfügbar",
+        "priority": "high"
+    }
+    }
+ */
+
+  const {
+    targetId,
+    targetClass,
+  } = payload;
+
+  /*const messageTime = new Date(publishTimestamp).getTime();
+  const latency = Date.now() - messageTime;
+
+  // Log latency metric for CloudWatch
+  console.log(JSON.stringify({
+    event_type: 'latency_measurement',
+    latency_seconds: parseFloat((latency / 1000).toFixed(5)),
+    message_id: snsMessage.MessageId,
+    timestamp: new Date().toISOString(),
+    publish_timestamp: publishTimestamp
+  }));
+
+  if (latency > VALIDITY_WINDOW_MILLISECONDS) {
+    console.warn(`Message expired. Latency (${latency}ms) > ${VALIDITY_WINDOW_MILLISECONDS}ms. Discarding.`);
+    return; // Stop processing this record
+  }*/
+
+  // 3. Find connections for the target
+  const indexNameMap = { user: 'UserIndex', org: 'OrgIndex', hub: 'HubIndex' };
+  const indexName = indexNameMap[targetClass];
+  const attributeName = targetClass === 'user' ? 'userId' : `${targetClass}Id`;
+  
+  if (!indexName) {
+    console.error(`Unsupported targetClass: ${targetClass}`);
+    return;
+  }
+
+  const queryCommand = new QueryCommand({
+    TableName: CONNECTION_TABLE,
+    IndexName: indexName,
+    KeyConditionExpression: `#attrName = :attrValue`,
+    ExpressionAttributeNames: { '#attrName': attributeName },
+    ExpressionAttributeValues: { ':attrValue': targetId },
+  });
+
+  const connections = await docClient.send(queryCommand);
+  if (!connections.Items || connections.Items.length === 0) {
+    console.log(`No connections found for ${targetClass}:${targetId}.`);
+    return;
+  }
+
+  console.log(`Found ${connections.Items.length} connections for ${targetClass}:${targetId}.`);
+
+  // 4. Send message to all found connections
+  const promises = connections.Items.map(async ({ connectionId }) => {
+    try {
+      await apiGateway.send(new PostToConnectionCommand({
+        ConnectionId: connectionId,
+        Data: payload,
+      }));
+      console.log(`Message sent to ${connectionId}`);
+    } catch (err) {
+      // If the connection is gone, delete it from the table.
+      if (err.statusCode === 410 || err.$metadata?.httpStatusCode === 410) {
+        console.log(`Deleting stale connection: ${connectionId}`);
+        await docClient.send(new DeleteCommand({
+          TableName: CONNECTION_TABLE,
+          Key: { connectionId },
+        }));
+      } else {
+        console.error(`Error sending to connection ${connectionId}:`, err);
+      }
+    }
+  });
+
+  await Promise.all(promises);
+};
+
+exports.handler = async (event) => {
+  console.log(`Received SQS event with ${event.Records.length} records.`);
+  const batchItemFailures = [];
+
+  for (const record of event.Records) {
+    try {
+      await processRecord(record);
+    } catch (error) {
+      console.error('Fatal error processing record:', record.messageId, error);
+      // Add the failed record's ID to the batchItemFailures list
+      batchItemFailures.push({
+        itemIdentifier: record.messageId,
+      });
+    }
+  }
+
+  // Return failures to SQS to re-process only the failed messages
+  console.log('Batch processing finished. Failures:', batchItemFailures.length);
+  return { batchItemFailures };
 };
