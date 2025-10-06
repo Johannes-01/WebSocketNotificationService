@@ -1,0 +1,10 @@
+{
+  "name": "message-handler",
+  "version": "1.0.0",
+  "description": "Handles incoming WebSocket messages and publishes them to SNS.",
+  "main": "index.js",
+  "dependencies": {
+    "@aws-sdk/client-sns": "^3.583.0",
+    "uuid": "^9.0.1"
+  }
+}
