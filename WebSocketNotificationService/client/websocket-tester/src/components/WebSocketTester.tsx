@@ -257,18 +257,35 @@ export default function WebSocketTester() {
       {/* Header */}
       <div className="bg-white shadow-sm border-b p-4">
         <div className="flex justify-between items-center">
-          <div>
-            <h1 className="text-2xl font-bold text-gray-900">WebSocket Notification Service Tester</h1>
-            <p className="text-sm text-gray-600">
-              Signed in as: <span className="font-medium">{user?.getUsername()}</span>
-            </p>
+          <div className="flex items-center gap-4">
+            <button
+              onClick={() => router.push('/')}
+              className="text-blue-600 hover:text-blue-800 text-sm font-medium"
+              title="Back to home"
+            >
+              ← Home
+            </button>
+            <div>
+              <h1 className="text-2xl font-bold text-gray-900">Single Client Tester</h1>
+              <p className="text-sm text-gray-600">
+                Signed in as: <span className="font-medium">{user?.getUsername()}</span>
+              </p>
+            </div>
           </div>
-          <button
-            onClick={handleSignOut}
-            className="px-4 py-2 bg-red-600 text-white rounded-md hover:bg-red-700 transition-colors text-sm font-medium"
-          >
-            Sign Out
-          </button>
+          <div className="flex gap-2">
+            <button
+              onClick={() => router.push('/multi-client')}
+              className="px-4 py-2 bg-purple-600 text-white rounded-md hover:bg-purple-700 transition-colors text-sm font-medium"
+            >
+              🔌 Multi-Client Mode
+            </button>
+            <button
+              onClick={handleSignOut}
+              className="px-4 py-2 bg-red-600 text-white rounded-md hover:bg-red-700 transition-colors text-sm font-medium"
+            >
+              Sign Out
+            </button>
+          </div>
         </div>
       </div>
 
