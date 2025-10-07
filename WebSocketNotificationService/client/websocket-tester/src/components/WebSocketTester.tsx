@@ -77,7 +77,7 @@ export default function WebSocketTester() {
             timestamp: new Date().toISOString(),
             direction: 'received',
             type: 'A2P',
-            content: data.payload?.content || JSON.stringify(data),
+            content: data.content || data.payload?.content || JSON.stringify(data),
             payload: data
           };
           setMessages(prev => [...prev, msg]);
