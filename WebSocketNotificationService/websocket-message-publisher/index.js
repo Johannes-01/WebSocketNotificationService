@@ -1,76 +1,144 @@
-const { SNSClient, PublishCommand } = require("@aws-sdk/client-sns");
+const { SNSClient, PublishCommand } = require('@aws-sdk/client-sns');
 
-const snsClient = new SNSClient({});
-const TOPIC_ARN = process.env.TOPIC_ARN;
+const sns = new SNSClient({});
 
-exports.handler = async (event, context) => {
-  try {
-    console.log("Received event:", JSON.stringify(event, null, 2));
-
-    let messageBody;
+exports.handler = async (event) => {
     try {
-      messageBody = JSON.parse(event.body);
-    } catch (e) {
-      console.error("Failed to parse message body:", e);
-      return { statusCode: 400, body: 'Invalid JSON format in message body.' };
-    }
+        console.log('Received WebSocket event:', JSON.stringify(event, null, 2));
 
-    const user_id = context['congitoUserId'];
-    console.log("Cognito User ID from context:", user_id);
-
-    const { targetChannel, payload } = messageBody;
-
-    if (!targetChannel || !payload || !user_id) {
-      console.error('Missing parameter in body.');
-      return {
-        statusCode: 400,
-        body: JSON.stringify({
-          error: 'Missing parameter in body.',
-        }),
-      };
-    }
-
-    const publishTimestamp = new Date().toISOString();
-
-    const messageToPublish = {
-      ...payload,
-      publishTimestamp: publishTimestamp,
-    };
-
-    const command = new PublishCommand({
-      TopicArn: process.env.TOPIC_ARN,
-      Message: JSON.stringify(messageToPublish),
-      MessageAttributes: {
-        targetChannel: {
-          DataType: 'String',
-          StringValue: targetChannel,
-        },
-        timestamp: {
-          DataType: 'String',
-          StringValue: publishTimestamp,
+        // Extract authenticated user ID from WebSocket authorizer context
+        const cognitoUserId = event.requestContext?.authorizer?.userId;
+        
+        if (!cognitoUserId) {
+            console.error('No authenticated user found in WebSocket context');
+            return {
+                statusCode: 401,
+                body: JSON.stringify({
+                    error: 'Unauthorized - No user ID in context',
+                }),
+            };
         }
-      },
-      MessageGroupId: cognitoUserId // For FIFO topics, ensure messages with same userId are ordered
-    });
 
-    const result = await snsClient.send(command);
+        let messageBody;
+        try {
+            messageBody = JSON.parse(event.body || '{}');
+        } catch (e) {
+            console.error('Failed to parse message body:', e);
+            return {
+                statusCode: 400,
+                body: JSON.stringify({
+                    error: 'Invalid JSON format in message body',
+                }),
+            };
+        }
 
-    console.log('Message published successfully:', result);
+        /**
+         * Expected WebSocket message format:
+         {
+            "action": "sendMessage", // WebSocket action (handled by $default route)
+            "targetChannel": "WebSocket", // WebSocket, Email, SMS, etc.
+            "messageType": "fifo", // "fifo" or "standard" (optional, defaults to "standard")
+            "messageGroupId": "chat-room-456", // Optional: for FIFO grouping (defaults to userId)
+            "payload": {
+                "targetId": "abc123xyz",
+                "targetClass": "user", // user, org, hub, project
+                "eventType": "notification",
+                "content": "Message content"
+            }
+         }
+         */
+        const { targetChannel, payload, messageType = 'standard', messageGroupId } = messageBody;
 
-    return {
-      statusCode: 200,
-      body: JSON.stringify({
-        message: 'Message sent successfully!',
-        messageId: result.MessageId,
-      })
-    };
-   } catch (error) {
-        console.error('Error in publish handler:', error);
-            
+        if (!targetChannel || !payload) {
+            console.error('Missing required parameters in body');
+            return {
+                statusCode: 400,
+                body: JSON.stringify({
+                    error: 'Missing required parameters: targetChannel and payload are required',
+                }),
+            };
+        }
+
+        // Validate messageType
+        if (messageType !== 'fifo' && messageType !== 'standard') {
+            console.error('Invalid messageType:', messageType);
+            return {
+                statusCode: 400,
+                body: JSON.stringify({
+                    error: 'Invalid messageType. Must be "fifo" or "standard"',
+                }),
+            };
+        }
+
+        console.log(`Publishing ${messageType} message from WebSocket user ${cognitoUserId} to targetChannel ${targetChannel}`);
+
+        const publishTimestamp = new Date().toISOString();
+
+        const messageToPublish = {
+            ...payload,
+            publishTimestamp: publishTimestamp,
+        };
+
+        // Select topic based on messageType
+        const topicArn = messageType === 'fifo' 
+            ? process.env.FIFO_TOPIC_ARN 
+            : process.env.STANDARD_TOPIC_ARN;
+
+        // Build publish command parameters
+        const publishParams = {
+            TopicArn: topicArn,
+            Message: JSON.stringify(messageToPublish),
+            MessageAttributes: {
+                targetChannel: {
+                    DataType: 'String',
+                    StringValue: targetChannel,
+                },
+                timestamp: {
+                    DataType: 'String',
+                    StringValue: publishTimestamp,
+                }
+            },
+        };
+
+        // Add FIFO-specific parameters only for FIFO topics
+        if (messageType === 'fifo') {
+            // Use user-provided messageGroupId or fallback to userId for safe default
+            const groupId = messageGroupId || cognitoUserId;
+            publishParams.MessageGroupId = groupId;
+            console.log(`Using MessageGroupId: ${groupId} (${messageGroupId ? 'user-provided' : 'auto-generated from userId'})`);
+            // MessageDeduplicationId is not needed due to ContentBasedDeduplication on the topic
+        }
+
+        const command = new PublishCommand(publishParams);
+
+        const result = await sns.send(command);
+
+        console.log('Message published successfully from WebSocket:', {
+            messageId: result.MessageId,
+            messageType: messageType,
+            targetChannel: targetChannel,
+            userId: cognitoUserId,
+            messageGroupId: messageType === 'fifo' ? (messageGroupId || cognitoUserId) : undefined,
+            topicArn: topicArn
+        });
+
+        return {
+            statusCode: 200,
+            body: JSON.stringify({
+                message: 'Message sent successfully via WebSocket!',
+                messageId: result.MessageId,
+                messageType: messageType,
+                targetChannel: targetChannel,
+                messageGroupId: messageType === 'fifo' ? (messageGroupId || cognitoUserId) : undefined,
+            })
+        };
+    } catch (error) {
+        console.error('Error in WebSocket publish handler:', error);
+        
         return {
             statusCode: 500,
             body: JSON.stringify({
-                error: 'Failed to send message',
+                error: 'Failed to send message via WebSocket',
                 details: error.message
             })
         };

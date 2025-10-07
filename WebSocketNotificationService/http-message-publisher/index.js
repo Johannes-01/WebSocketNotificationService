@@ -1,60 +1,6 @@
 const { SNSClient, PublishCommand } = require('@aws-sdk/client-sns');
-/*const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
-const { DynamoDBDocumentClient, QueryCommand, ScanCommand } = require('@aws-sdk/lib-dynamodb');
-const dynamoClient = new DynamoDBClient({});
-const dynamoDB = DynamoDBDocumentClient.from(dynamoClient);
-*/
 
 const sns = new SNSClient({});
-
-/*async function checkConnectionAvailability(targetId) 
-{
-    // const targetAttribute = targetClass === "org" ? "orgId" : targetClass === "hub" ? "hubId" : "userId";
-    try {    
-            const queryCommand = new QueryCommand({
-                TableName: process.env.CONNECTION_TABLE,
-                IndexName: 'UserIndex',
-                KeyConditionExpression: "#targetAttribute = :targetId",
-                ExpressionAttributeValues: {
-                    ':targetId': targetId
-                },
-                ExpressionAttributeNames: {
-                    '#targetAttribute': targetAttribute,
-                },
-                Select: 'COUNT',
-            });
-                
-            const result = await dynamoDB.send(queryCommand);
-            return result.Count > 0;
-        
-        // For hub/org, check that at least one connection exists
-        const indexName = targetClass === "org" ? "OrgIndex" : "HubIndex";
-        const queryCommand = new QueryCommand({
-            TableName: process.env.CONNECTION_TABLE,
-            IndexName: indexName,
-            KeyConditionExpression: "#targetAttribute = :targetId",
-            ExpressionAttributeValues: {
-                ':targetId': targetId
-            },
-            ExpressionAttributeNames: {
-                '#targetAttribute': targetAttribute,
-            },
-            Select: 'COUNT',
-        });
-
-        const result = await dynamoDB.send(queryCommand);
-        console.log(`Found ${result.Count} connections for targetClass ${targetClass} with targetId ${targetId}`);
-        return result.Count > 0;
-    } catch (error) {
-        console.error('checkConnectionAvailability failed:', {
-            error: error.message,
-            stack: error.stack,
-            targetClass: targetClass,
-            targetId: targetId
-        });
-        return false;
-  }
-}*/
 
 exports.handler = async (event) => {
     try {
@@ -81,21 +27,22 @@ exports.handler = async (event) => {
         }
 
         /**
-         * 
+         * Expected message format:
          {
             "messageId": "123456",
             "timestamp": "2025-10-03T14:00:00Z",
-            "targetChannel": "WebSocket",
+            "targetChannel": "WebSocket", // WebSocket, Email, SMS, etc.
+            "messageType": "fifo", // "fifo" or "standard" (optional, defaults to "standard")
+            "messageGroupId": "chat-room-456", // Optional: for FIFO grouping (defaults to userId)
             "payload": {
                 "targetId": "abc123xyz",
-                "targetClass": "user", // user, org, hub
+                "targetClass": "user", // user, org, hub, project
                 "eventType": "notification",
-                "content": "Neue Nachricht verfügbar",
-                "priority": "high"
+                "content": "Neue Nachricht verfügbar"
             }
             }
          */
-        const { targetChannel, payload } = messageBody;
+        const { targetChannel, payload, messageType = 'standard', messageGroupId } = messageBody;
 
         if (!targetChannel || !payload ) {
             console.error('Missing parameter in body.');
@@ -106,27 +53,28 @@ exports.handler = async (event) => {
                     'Access-Control-Allow-Origin': '*',
                 },
                 body: JSON.stringify({
-                    error: 'Missing parameter in body.',
+                    error: 'Missing required parameters: targetChannel and payload are required.',
                 }),
             };
         }
-            
-        console.log(`Publishing message for cognito user ${cognitoUserId} to targetChannel ${targetChannel}`);
 
-        /*const authorized = await checkConnectionAvailability(targetId);
-        if(!authorized) {
+        // Validate messageType
+        if (messageType !== 'fifo' && messageType !== 'standard') {
+            console.error('Invalid messageType:', messageType);
             return {
-                statusCode: 404,
+                statusCode: 400,
                 headers: {
                     'Content-Type': 'application/json',
                     'Access-Control-Allow-Origin': '*',
                 },
                 body: JSON.stringify({
-                    error: `No available target "${targetId}" found`,
+                    error: 'Invalid messageType. Must be "fifo" or "standard".',
                 }),
             };
-        }*/
-           
+        }
+            
+        console.log(`Publishing ${messageType} message for cognito user ${cognitoUserId} to targetChannel ${targetChannel}`);
+
         const publishTimestamp = new Date().toISOString();
 
         const messageToPublish = {
@@ -134,8 +82,14 @@ exports.handler = async (event) => {
             publishTimestamp: publishTimestamp,
         };
 
-        const command = new PublishCommand({
-            TopicArn: process.env.TOPIC_ARN,
+        // Select topic based on messageType
+        const topicArn = messageType === 'fifo' 
+            ? process.env.FIFO_TOPIC_ARN 
+            : process.env.STANDARD_TOPIC_ARN;
+
+        // Build publish command parameters
+        const publishParams = {
+            TopicArn: topicArn,
             Message: JSON.stringify(messageToPublish),
             MessageAttributes: {
                 targetChannel: {
@@ -147,12 +101,28 @@ exports.handler = async (event) => {
                   StringValue: publishTimestamp,
                 }
             },
-            MessageGroupId: cognitoUserId // For FIFO topics, ensure messages with same userId are ordered
-        });
+        };
+
+        // Add FIFO-specific parameters only for FIFO topics
+        if (messageType === 'fifo') {
+            // Use user-provided messageGroupId or fallback to userId for safe default
+            const groupId = messageGroupId || cognitoUserId;
+            publishParams.MessageGroupId = groupId;
+            console.log(`Using MessageGroupId: ${groupId} (${messageGroupId ? 'user-provided' : 'auto-generated from userId'})`);
+            // MessageDeduplicationId is not needed due to ContentBasedDeduplication on the topic
+        }
+
+        const command = new PublishCommand(publishParams);
 
         const result = await sns.send(command);
 
-        console.log('Message published successfully:', result);
+        console.log('Message published successfully:', {
+            messageId: result.MessageId,
+            messageType: messageType,
+            targetChannel: targetChannel,
+            messageGroupId: messageType === 'fifo' ? (messageGroupId || cognitoUserId) : undefined,
+            topicArn: topicArn
+        });
             
         return {
             statusCode: 200,
@@ -163,6 +133,9 @@ exports.handler = async (event) => {
             body: JSON.stringify({
                message: 'Message sent successfully!',
                messageId: result.MessageId,
+               messageType: messageType,
+               targetChannel: targetChannel,
+               messageGroupId: messageType === 'fifo' ? (messageGroupId || cognitoUserId) : undefined,
             })
         };    
     } catch (error) {

@@ -5,7 +5,7 @@ Create a web typescript, next.js, react web application that uses tailwind with 
 - [ ] a WebSocket connection manager
   - [ ] connecting
     - [ ] When connecting set the accessToken as 'token' query parameter
-    - [ ] also set query paramets for userId, orgId and hubId
+    - [ ] also set query parameters for userId, orgId, hubId, and optionally projectId
   - [ ] disconnecting with retrying to connect
   - [ ] error handling
   - [ ] publishing service messages via sending json data over WebSocket to the server
@@ -20,10 +20,9 @@ Create a web typescript, next.js, react web application that uses tailwind with 
      "targetChannel": "WebSocket",
      "payload": {
        "targetId": "abc123xyz",
-       "targetClass": "user", // user, org, hub
+       "targetClass": "user", // user, org, hub, project
        "eventType": "notification",
-       "content": "Message content",
-       "priority": "high"
+       "content": "Message content"
      }
    }
 ```

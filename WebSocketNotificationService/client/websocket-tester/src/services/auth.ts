@@ -93,3 +93,35 @@ export async function getSession(): Promise<CognitoUserSession> {
     });
   });
 }
+
+export async function confirmSignUp(username: string, code: string): Promise<void> {
+  const userData = {
+    Username: username,
+    Pool: userPool,
+  };
+
+  const cognitoUser = new CognitoUser(userData);
+
+  return new Promise((resolve, reject) => {
+    cognitoUser.confirmRegistration(code, true, (err, result) => {
+      if (err) return reject(err);
+      resolve();
+    });
+  });
+}
+
+export async function resendConfirmationCode(username: string): Promise<void> {
+  const userData = {
+    Username: username,
+    Pool: userPool,
+  };
+
+  const cognitoUser = new CognitoUser(userData);
+
+  return new Promise((resolve, reject) => {
+    cognitoUser.resendConfirmationCode((err, result) => {
+      if (err) return reject(err);
+      resolve();
+    });
+  });
+}

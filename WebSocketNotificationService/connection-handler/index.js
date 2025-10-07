@@ -8,7 +8,7 @@ exports.handler = async (event) => {
   try {
     console.log('Received event:', JSON.stringify(event, null, 2));
     const connectionId = event.requestContext.connectionId;
-    const { cognitoUserId, userId, orgId, hubId } = event.requestContext.authorizer || {};
+    const { cognitoUserId, userId, orgId, hubId, projectId } = event.requestContext.authorizer || {};
 
     const tableName = process.env.CONNECTION_TABLE;
 
@@ -20,15 +20,22 @@ exports.handler = async (event) => {
             body: 'Missing one or more of the required query parameters: token, hubId, orgId, userId',
           };
         }
+        const item = {
+          connectionId,
+          cognitoUserId,
+          userId,
+          orgId,
+          hubId,
+        };
+        
+        // Add projectId only if provided
+        if (projectId) {
+          item.projectId = projectId;
+        }
+        
         await dynamoDB.send(new PutCommand({
           TableName: tableName,
-          Item: {
-            connectionId,
-            cognitoUserId,
-            userId,
-            orgId,
-            hubId,
-          },
+          Item: item,
         }));
         return { statusCode: 200, body: 'Connected successfully' };
       case '$disconnect':

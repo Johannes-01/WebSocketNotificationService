@@ -2,25 +2,11 @@ import { NextResponse } from 'next/server';
 import type { NextRequest } from 'next/server';
 
 export function middleware(request: NextRequest) {
-  // Check if the user is authenticated by looking for session tokens
-  const session = request.cookies.get('session');
-
-  // List of paths that don't require authentication
-  const publicPaths = ['/signin', '/signup'];
-  const isPublicPath = publicPaths.some(path => request.nextUrl.pathname.startsWith(path));
-
-  if (!session && !isPublicPath) {
-    // Redirect to signin page if not authenticated and trying to access protected route
-    const signinUrl = new URL('/signin', request.url);
-    signinUrl.searchParams.set('redirect', request.nextUrl.pathname);
-    return NextResponse.redirect(signinUrl);
-  }
-
-  if (session && isPublicPath) {
-    // Redirect to home page if authenticated and trying to access auth pages
-    return NextResponse.redirect(new URL('/', request.url));
-  }
-
+  // Since we're using Cognito with client-side authentication (localStorage),
+  // we can't reliably check auth state in middleware (which runs server-side).
+  // Authentication checks are handled client-side in the AuthProvider and page components.
+  
+  // We only handle basic redirects here for better UX
   return NextResponse.next();
 }
 

@@ -13,6 +13,7 @@ interface AuthContextType {
   signIn: (username: string, password: string) => Promise<void>;
   signUp: (email: string, password: string, attributes?: Record<string, string>) => Promise<void>;
   signOut: () => Promise<void>;
+  getIdToken: () => Promise<string | null>;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
@@ -77,6 +78,19 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   };
 
+  const getIdToken = async (): Promise<string | null> => {
+    try {
+      if (tokens?.idToken) {
+        return tokens.idToken;
+      }
+      const session = await authService.getSession();
+      return session.getIdToken().getJwtToken();
+    } catch (error) {
+      console.error('Error getting ID token:', error);
+      return null;
+    }
+  };
+
   const value = {
     user,
     tokens,
@@ -85,6 +99,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     signIn,
     signUp,
     signOut,
+    getIdToken,
   };
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

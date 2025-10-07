@@ -45,6 +45,7 @@ exports.handler = async (event, context) => {
   const hubId = event.queryStringParameters?.hubId;
   const orgId = event.queryStringParameters?.orgId;
   const userId = event.queryStringParameters?.userId;
+  const projectId = event.queryStringParameters?.projectId; // Optional
 
   if (!token || !hubId || !orgId || !userId) {
     console.log('Missing one or more of the required query parameters: token, hubId, orgId, userId');
@@ -61,15 +62,20 @@ exports.handler = async (event, context) => {
     const cognitoUserId = decodedToken.sub;
 
     console.log(`Decoded token for cognito user ${cognitoUserId}:`, JSON.stringify(decodedToken, null, 2));
-    const context = {
+    const authContext = {
         cognitoUserId: cognitoUserId,
         userId: userId,
         hubId: hubId,
         orgId: orgId,
         username: decodedToken['cognito:username'] || decodedToken.username
+    };
+    
+    // Add projectId only if provided
+    if (projectId) {
+      authContext.projectId = projectId;
     }
 
-    return generateAllow(cognitoUserId, event.methodArn, context);
+    return generateAllow(cognitoUserId, event.methodArn, authContext);
   } catch (error) {
     console.error('Authorization error:', error);
     return generateDeny('user', event.methodArn);

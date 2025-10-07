@@ -16,67 +16,71 @@ const VALIDITY_WINDOW_MILLISECONDS = 10000; // 10 seconds
 const processRecord = async (record) => {
   console.log('Processing SQS record:', record.messageId);
 
-  // 1. Parse the message body
+  // 1. Parse the message body (SQS wraps SNS message)
   const snsMessage = JSON.parse(record.body);
   const message = JSON.parse(snsMessage.Message);
 
-  const {
-    TargetClass,
-    payload,
-    publishTimestamp
-  } = message;
-
-  // 2. Validate payload and check message expiration
-  if (!TargetClass || !publishTimestamp || !payload) {
-    console.error('Invalid message structure. Missing required fields.', message);
-    return;
-  }
-
   /**
- * 
- {
-    "messageId": "123456",
-    "timestamp": "2025-10-03T14:00:00Z",
-    "targetChannel": "WebSocket",
-    "payload": {
-        "targetId": "abc123xyz",
-        "targetClass": "user", // user, org, hub
-        "eventType": "notification",
-        "content": "Neue Nachricht verfügbar",
-        "priority": "high"
-    }
-    }
- */
+   * Expected message structure from both P2P and A2P publishers:
+   * {
+   *   "targetId": "abc123xyz",
+   *   "targetClass": "user", // user, org, hub, project
+   *   "eventType": "notification",
+   *   "content": "Message content",
+   *   "publishTimestamp": "2025-10-03T14:00:00Z"
+   * }
+   */
 
   const {
     targetId,
     targetClass,
-  } = payload;
+    publishTimestamp,
+    ...messagePayload
+  } = message;
 
-  /*const messageTime = new Date(publishTimestamp).getTime();
+  // 2. Validate required fields
+  if (!targetId || !targetClass || !publishTimestamp) {
+    console.error('Invalid message structure. Missing required fields:', {
+      targetId,
+      targetClass,
+      publishTimestamp,
+      message
+    });
+    return;
+  }
+
+  // 3. Calculate and log latency metric for CloudWatch
+  const messageTime = new Date(publishTimestamp).getTime();
   const latency = Date.now() - messageTime;
 
-  // Log latency metric for CloudWatch
   console.log(JSON.stringify({
     event_type: 'latency_measurement',
     latency_seconds: parseFloat((latency / 1000).toFixed(5)),
     message_id: snsMessage.MessageId,
     timestamp: new Date().toISOString(),
-    publish_timestamp: publishTimestamp
+    publish_timestamp: publishTimestamp,
+    target_class: targetClass,
+    target_id: targetId
   }));
 
+  // 4. Check message expiration
   if (latency > VALIDITY_WINDOW_MILLISECONDS) {
     console.warn(`Message expired. Latency (${latency}ms) > ${VALIDITY_WINDOW_MILLISECONDS}ms. Discarding.`);
     return; // Stop processing this record
-  }*/
+  }
 
-  // 3. Find connections for the target
-  const indexNameMap = { user: 'UserIndex', org: 'OrgIndex', hub: 'HubIndex' };
+  // 5. Find connections for the target
+  const indexNameMap = { 
+    user: 'UserIndex', 
+    org: 'OrgIndex', 
+    hub: 'HubIndex',
+    project: 'ProjectIndex'
+  };
   const indexName = indexNameMap[targetClass];
   const attributeName = targetClass === 'user' ? 'userId' : `${targetClass}Id`;
   
   if (!indexName) {
-    console.error(`Unsupported targetClass: ${targetClass}`);
+    console.error(`Unsupported targetClass: ${targetClass}. Must be 'user', 'org', 'hub', or 'project'.`);
     return;
   }
 
@@ -90,35 +94,48 @@ const processRecord = async (record) => {
 
   const connections = await docClient.send(queryCommand);
   if (!connections.Items || connections.Items.length === 0) {
-    console.log(`No connections found for ${targetClass}:${targetId}.`);
+    console.log(`No active connections found for ${targetClass}:${targetId}.`);
     return;
   }
 
-  console.log(`Found ${connections.Items.length} connections for ${targetClass}:${targetId}.`);
+  console.log(`Found ${connections.Items.length} active connection(s) for ${targetClass}:${targetId}.`);
 
-  // 4. Send message to all found connections
+  // 6. Send message to all found connections
   const promises = connections.Items.map(async ({ connectionId }) => {
     try {
+      // Send the full message including metadata to WebSocket client
+      const dataToSend = JSON.stringify({
+        ...messagePayload,
+        targetId,
+        targetClass,
+        publishTimestamp,
+        receivedTimestamp: new Date().toISOString(),
+        latencyMs: latency
+      });
+
       await apiGateway.send(new PostToConnectionCommand({
         ConnectionId: connectionId,
-        Data: payload,
+        Data: dataToSend,
       }));
-      console.log(`Message sent to ${connectionId}`);
+      
+      console.log(`Message sent successfully to connection ${connectionId}`);
     } catch (err) {
-      // If the connection is gone, delete it from the table.
+      // If the connection is gone (410 Gone), delete it from the table
       if (err.statusCode === 410 || err.$metadata?.httpStatusCode === 410) {
-        console.log(`Deleting stale connection: ${connectionId}`);
+        console.log(`Stale connection detected (410 Gone). Deleting connection: ${connectionId}`);
         await docClient.send(new DeleteCommand({
           TableName: CONNECTION_TABLE,
           Key: { connectionId },
         }));
       } else {
         console.error(`Error sending to connection ${connectionId}:`, err);
+        throw err; // Re-throw to trigger SQS retry
       }
     }
   });
 
   await Promise.all(promises);
+  console.log(`Finished processing message for ${targetClass}:${targetId}`);
 };
 
 exports.handler = async (event) => {

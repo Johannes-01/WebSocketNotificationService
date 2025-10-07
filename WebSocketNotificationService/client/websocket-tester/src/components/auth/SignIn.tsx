@@ -1,6 +1,7 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
+import { useRouter, useSearchParams } from 'next/navigation';
 import { useAuth } from '@/contexts/AuthContext';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -13,25 +14,57 @@ import {
 } from '@/components/ui/card';
 
 export default function SignIn() {
-  const { signIn } = useAuth();
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const { signIn, user, isLoading: authLoading } = useAuth();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
+  const [successMessage, setSuccessMessage] = useState<string | null>(null);
+
+  useEffect(() => {
+    // If already authenticated, redirect to home
+    if (!authLoading && user) {
+      const redirectTo = searchParams.get('redirect') || '/';
+      router.push(redirectTo);
+    }
+  }, [user, authLoading, router, searchParams]);
+
+  useEffect(() => {
+    if (searchParams.get('verified') === 'true') {
+      setSuccessMessage('Email verified successfully! You can now sign in.');
+    }
+  }, [searchParams]);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setError(null);
+    setSuccessMessage(null);
     setIsLoading(true);
 
     try {
       await signIn(email, password);
-      // Successful sign in will update the auth context
+      // Redirect will happen via useEffect when user state updates
+      const redirectTo = searchParams.get('redirect') || '/';
+      router.push(redirectTo);
     } catch (err: any) {
       setError(err.message || 'Failed to sign in');
     } finally {
       setIsLoading(false);
     }
+  }
+
+  // Show loading while checking auth state
+  if (authLoading) {
+    return (
+      <div className="min-h-screen flex items-center justify-center">
+        <div className="text-center">
+          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 mx-auto mb-4"></div>
+          <p className="text-gray-600">Loading...</p>
+        </div>
+      </div>
+    );
   }
 
   return (
@@ -44,6 +77,11 @@ export default function SignIn() {
           </CardDescription>
         </CardHeader>
         <CardContent>
+          {successMessage && (
+            <div className="mb-4 text-sm text-green-600 text-center bg-green-50 p-3 rounded-md">
+              {successMessage}
+            </div>
+          )}
           <form onSubmit={handleSubmit} className="space-y-4">
             <div className="space-y-2">
               <Input
@@ -68,7 +106,9 @@ export default function SignIn() {
               />
             </div>
             {error && (
-              <div className="text-sm text-destructive text-center">{error}</div>
+              <div className="text-sm text-destructive text-center bg-destructive/10 p-3 rounded-md">
+                {error}
+              </div>
             )}
             <Button
               type="submit"
@@ -78,6 +118,12 @@ export default function SignIn() {
               {isLoading ? 'Signing in...' : 'Sign in'}
             </Button>
           </form>
+          <div className="mt-4 text-center text-sm">
+            Don't have an account?{' '}
+            <a href="/signup" className="text-primary hover:underline">
+              Sign up
+            </a>
+          </div>
         </CardContent>
       </Card>
     </div>

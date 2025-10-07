@@ -19,7 +19,7 @@ export class WebSocketNotificationService extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
 
-    const stackName = process.env.STACK_NAME || 'WebSocketNotificationServiceStack';
+    const stackName = process.env.STACK_NAME || 'NotificationServiceStack';
     this.node.setContext('stackName', stackName);
 
     const userPool = new congnito.UserPool(this, 'UserPool', {
@@ -66,24 +66,49 @@ export class WebSocketNotificationService extends cdk.Stack {
       topicName: `${stackName}-Notification`,
     });
   
-    // optional: DLQ for failed notifications
-    const dlq = new sqs.Queue(this, 'NotificationDLQ', {
-      fifo: true
+    // DLQ for failed WebSocket FIFO notifications
+    const webSocketFifoDlq = new sqs.Queue(this, 'WebSocketFifoDLQ', {
+      queueName: `${stackName}-WebSocketFifoDLQ.fifo`,
+      fifo: true,
     });
 
-    // SQS FIFO Queue to buffer messages for the processor
-    const notificationQueue = new sqs.Queue(this, 'NotificationQueue', {
-      queueName: `${stackName}-NotificationQueue.fifo`,
+    // DLQ for failed WebSocket Standard notifications
+    const webSocketStandardDlq = new sqs.Queue(this, 'WebSocketStandardDLQ', {
+      queueName: `${stackName}-WebSocketStandardDLQ`,
+    });
+
+    // SQS FIFO Queue to buffer WebSocket messages for the processor
+    const webSocketFifoQueue = new sqs.Queue(this, 'WebSocketFifoQueue', {
+      queueName: `${stackName}-WebSocketFifoQueue.fifo`,
       fifo: true,
       visibilityTimeout: cdk.Duration.seconds(60),
       deadLetterQueue: {
         maxReceiveCount: 3,
-        queue: dlq,
+        queue: webSocketFifoDlq,
       },
     });
 
-    // Subscribe the SQS FIFO queue to the SNS FIFO topic
-    notificationFifoTopic.addSubscription(new subscription.SqsSubscription(notificationQueue, {
+    // SQS Standard Queue to buffer WebSocket messages for the processor (high-throughput, reliable)
+    const webSocketStandardQueue = new sqs.Queue(this, 'WebSocketStandardQueue', {
+      queueName: `${stackName}-WebSocketStandardQueue`,
+      visibilityTimeout: cdk.Duration.seconds(60),
+      deadLetterQueue: {
+        maxReceiveCount: 3,
+        queue: webSocketStandardDlq,
+      },
+    });
+
+    // Subscribe the SQS FIFO queue to the SNS FIFO topic with targetChannel filter
+    notificationFifoTopic.addSubscription(new subscription.SqsSubscription(webSocketFifoQueue, {
+      filterPolicy: {
+        targetChannel: sns.SubscriptionFilter.stringFilter({
+          allowlist: ['WebSocket'],
+        }),
+      },
+    }));
+
+    // Subscribe the SQS Standard queue to the SNS Standard topic with targetChannel filter
+    notificationTopic.addSubscription(new subscription.SqsSubscription(webSocketStandardQueue, {
       filterPolicy: {
         targetChannel: sns.SubscriptionFilter.stringFilter({
           allowlist: ['WebSocket'],
@@ -136,7 +161,7 @@ export class WebSocketNotificationService extends cdk.Stack {
       },
     });
 
-    /*connectionTable.addGlobalSecondaryIndex({
+    connectionTable.addGlobalSecondaryIndex({
       indexName: 'OrgIndex',
       partitionKey: {
         name: 'orgId',
@@ -150,7 +175,15 @@ export class WebSocketNotificationService extends cdk.Stack {
         name: 'hubId',
         type: dynamodb.AttributeType.STRING,
       },
-    });*/
+    });
+
+    connectionTable.addGlobalSecondaryIndex({
+      indexName: 'ProjectIndex',
+      partitionKey: {
+        name: 'projectId',
+        type: dynamodb.AttributeType.STRING,
+      },
+    });
 
     connectionTable.grantWriteData(connectionHandler);
 
@@ -168,23 +201,28 @@ export class WebSocketNotificationService extends cdk.Stack {
       integration: LambdaIntegration,
     });
 
-    // P2P via $default route
-    const webSocketMessagePublisher = new lambda.Function(this, 'WebSocketMessagePubisher', {
+    // ============================================
+    // P2P (Person-to-Person) - WebSocket $default route
+    // Authenticated users publish messages via WebSocket
+    // ============================================
+    const p2pWebSocketPublisher = new lambda.Function(this, 'P2PWebSocketPublisher', {
       runtime: lambda.Runtime.NODEJS_22_X,
       handler: 'index.handler',
       code: lambda.Code.fromAsset('../websocket-message-publisher'),
       environment: {
-        TOPIC_ARN: notificationFifoTopic.topicArn,
+        FIFO_TOPIC_ARN: notificationFifoTopic.topicArn,
+        STANDARD_TOPIC_ARN: notificationTopic.topicArn,
       },
       timeout: cdk.Duration.seconds(10),
     });
 
-    notificationFifoTopic.grantPublish(webSocketMessagePublisher);
+    notificationFifoTopic.grantPublish(p2pWebSocketPublisher);
+    notificationTopic.grantPublish(p2pWebSocketPublisher);
 
     webSocketApi.addRoute('$default', {
       integration: new integrations.WebSocketLambdaIntegration(
-        'DefaultIntegration',
-        webSocketMessagePublisher
+        'P2PWebSocketIntegration',
+        p2pWebSocketPublisher
       ),
     });
 
@@ -206,7 +244,10 @@ export class WebSocketNotificationService extends cdk.Stack {
       value: WebSocketApiStage.url,
     });
 
-    // Http Api to publish SNS messages
+    // ============================================
+    // A2P (Application-to-Person) - HTTP REST API
+    // External services publish messages via HTTPS
+    // ============================================
     const notificationApi = new apigateway.RestApi(this, 'NotificationApi', {
       defaultCorsPreflightOptions: {
         allowOrigins: ['localhost:3000'],
@@ -220,18 +261,20 @@ export class WebSocketNotificationService extends cdk.Stack {
 
     const publishResource = notificationApi.root.addResource('publish');
 
-    const HttpPublishHandler = new lambda.Function(this, 'HttpPublishHandler', {
+    // A2P Publisher Lambda - Handles HTTP requests from external services
+    const a2pHttpPublisher = new lambda.Function(this, 'A2PHttpPublisher', {
       runtime: lambda.Runtime.NODEJS_22_X,
       handler: 'index.handler',
-      code: lambda.Code.fromAsset('../publisher'),
+      code: lambda.Code.fromAsset('../http-message-publisher'),
       environment: {
-      TOPIC_ARN: notificationFifoTopic.topicArn,
-      /*CONNECTION_TABLE: connectionTable.tableName,*/
+      FIFO_TOPIC_ARN: notificationFifoTopic.topicArn,
+      STANDARD_TOPIC_ARN: notificationTopic.topicArn,
       },
+      timeout: cdk.Duration.seconds(10),
     });
 
-    // connectionTable.grantReadData(HttpPublishHandler);
-    notificationFifoTopic.grantPublish(HttpPublishHandler);
+    notificationFifoTopic.grantPublish(a2pHttpPublisher);
+    notificationTopic.grantPublish(a2pHttpPublisher);
     
     const cognitoAuthorizer = new apigateway.CognitoUserPoolsAuthorizer(this, 'CognitoAuthorizer', {
       cognitoUserPools: [userPool],
@@ -239,8 +282,8 @@ export class WebSocketNotificationService extends cdk.Stack {
       identitySource: 'method.request.header.Authorization',
     });
 
-    const HttpPublishIntegration = new apigateway.LambdaIntegration(HttpPublishHandler);
-    publishResource.addMethod('POST', HttpPublishIntegration, {
+    const a2pHttpPublishIntegration = new apigateway.LambdaIntegration(a2pHttpPublisher);
+    publishResource.addMethod('POST', a2pHttpPublishIntegration, {
       authorizer: cognitoAuthorizer,
       authorizationType: apigateway.AuthorizationType.COGNITO,
     });
@@ -259,9 +302,15 @@ export class WebSocketNotificationService extends cdk.Stack {
       reservedConcurrentExecutions: 10,
     });
 
-    // New SQS event source for the processor
-    processorLambda.addEventSource(new SqsEventSource(notificationQueue, {
+    // SQS event source for FIFO messages (ordered, deduplicated)
+    processorLambda.addEventSource(new SqsEventSource(webSocketFifoQueue, {
       batchSize: 5,
+      reportBatchItemFailures: true,
+    }));
+
+    // SQS event source for Standard messages (high-throughput, reliable)
+    processorLambda.addEventSource(new SqsEventSource(webSocketStandardQueue, {
+      batchSize: 10, // Higher batch size for standard queue for better throughput
       reportBatchItemFailures: true,
     }));
 
@@ -310,7 +359,7 @@ export class WebSocketNotificationService extends cdk.Stack {
         logs.FilterPattern.numberValue('$.latency_seconds', '>', 3)
       ), // Messages over 3 seconds
       metricName: 'HighLatencyMessageCount',
-      metricNamespace: 'WebSocketNotificationService',
+      metricNamespace: 'NotificationService',
       metricValue: '1', // Count each occurrence
       unit: cloudwatch.Unit.COUNT,
     });
@@ -336,7 +385,7 @@ export class WebSocketNotificationService extends cdk.Stack {
         logs.FilterPattern.exists('$.latency_seconds')
       ),
       metricName: 'MessageLatency',
-      metricNamespace: 'WebSocketNotificationService',
+      metricNamespace: 'NotificationService',
       metricValue: '$.latency_seconds',
       unit: cloudwatch.Unit.MILLISECONDS,
       defaultValue: 0, // Important: provides default value when no logs match
@@ -365,7 +414,7 @@ export class WebSocketNotificationService extends cdk.Stack {
 
 
     const latencyDashboard = new cloudwatch.Dashboard(this, 'LatencyDashboard', {
-      dashboardName: 'WebSocketNotificationService-Latency',
+      dashboardName: 'NotificationService-Latency',
     })
 
     const latencyMetric = latencyMetricFilter.metric({
