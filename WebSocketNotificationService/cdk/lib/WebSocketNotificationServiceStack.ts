@@ -242,6 +242,17 @@ export class WebSocketNotificationService extends cdk.Stack {
 
     new cdk.CfnOutput(this, 'WebSocketApiUrl', {
       value: WebSocketApiStage.url,
+      description: 'WebSocket API endpoint URL',
+    });
+
+    new cdk.CfnOutput(this, 'UserPoolId', {
+      value: userPool.userPoolId,
+      description: 'Cognito User Pool ID',
+    });
+
+    new cdk.CfnOutput(this, 'UserPoolClientId', {
+      value: userPoolClient.userPoolClientId,
+      description: 'Cognito User Pool Client ID',
     });
 
     // ============================================
@@ -249,13 +260,22 @@ export class WebSocketNotificationService extends cdk.Stack {
     // External services publish messages via HTTPS
     // ============================================
     const notificationApi = new apigateway.RestApi(this, 'NotificationApi', {
+      restApiName: `${stackName}-NotificationApi`,
+      description: 'HTTP API for publishing notifications (A2P)',
+      deployOptions: {
+        stageName: 'dvl',
+      },
       defaultCorsPreflightOptions: {
-        allowOrigins: ['localhost:3000'],
+        allowOrigins: apigateway.Cors.ALL_ORIGINS,
         allowMethods: ['POST', 'OPTIONS'],
         allowHeaders: [
-          ...apigateway.Cors.DEFAULT_HEADERS,
-          'Authorization',],
-        allowCredentials: true,
+          'Content-Type',
+          'Authorization',
+          'X-Amz-Date',
+          'X-Api-Key',
+          'X-Amz-Security-Token',
+        ],
+        allowCredentials: false,
       }
     });
 
@@ -286,6 +306,12 @@ export class WebSocketNotificationService extends cdk.Stack {
     publishResource.addMethod('POST', a2pHttpPublishIntegration, {
       authorizer: cognitoAuthorizer,
       authorizationType: apigateway.AuthorizationType.COGNITO,
+    });
+
+    // Output the REST API URL
+    new cdk.CfnOutput(this, 'NotificationApiUrl', {
+      value: notificationApi.url + 'publish',
+      description: 'HTTP REST API endpoint for A2P message publishing',
     });
 
     // receives SNS notifications and processes them

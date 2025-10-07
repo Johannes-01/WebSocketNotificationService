@@ -33,7 +33,7 @@ export default function WebSocketTester() {
   const [eventType, setEventType] = useState('notification');
   const [messageContent, setMessageContent] = useState('');
   const [messageType, setMessageType] = useState<'standard' | 'fifo'>('standard');
-  const [priority, setPriority] = useState<'low' | 'normal' | 'high'>('normal');
+  const [messageGroupId, setMessageGroupId] = useState('');
   
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
@@ -134,18 +134,18 @@ export default function WebSocketTester() {
       action: 'sendMessage',
       targetChannel: 'WebSocket',
       messageType,
+      ...(messageType === 'fifo' && messageGroupId && { messageGroupId }),
       payload: {
         targetId,
         targetClass,
         eventType,
         content: messageContent,
-        priority,
         timestamp: new Date().toISOString()
       }
     };
 
     ws.send(JSON.stringify(message));
-    addLog(`📤 Sent P2P message to ${targetClass}:${targetId}`);
+    addLog(`📤 Sent P2P message to ${targetClass}:${targetId}${messageType === 'fifo' && messageGroupId ? ` (group: ${messageGroupId})` : ''}`);
 
     const msg: Message = {
       id: Math.random().toString(36),
@@ -172,21 +172,30 @@ export default function WebSocketTester() {
         return;
       }
 
+      const endpoint = process.env.NEXT_PUBLIC_HTTP_PUBLISH_ENDPOINT;
+      if (!endpoint) {
+        addLog('❌ HTTP publish endpoint not configured in environment variables');
+        console.error('NEXT_PUBLIC_HTTP_PUBLISH_ENDPOINT is not set');
+        return;
+      }
+
       const message = {
         targetChannel: 'WebSocket',
         messageType,
+        ...(messageType === 'fifo' && messageGroupId && { messageGroupId }),
         payload: {
           targetId,
           targetClass,
           eventType,
           content: messageContent,
-          priority,
           timestamp: new Date().toISOString()
         }
       };
 
-      addLog(`📤 Sending A2P message via HTTP...`);
-      const response = await fetch(process.env.NEXT_PUBLIC_HTTP_PUBLISH_ENDPOINT!, {
+      addLog(`📤 Sending A2P message via HTTP to ${endpoint}...${messageType === 'fifo' && messageGroupId ? ` (group: ${messageGroupId})` : ''}`);
+      console.log('A2P Request:', { endpoint, message, token: `${token.substring(0, 20)}...` });
+      
+      const response = await fetch(endpoint, {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${token}`,
@@ -195,8 +204,12 @@ export default function WebSocketTester() {
         body: JSON.stringify(message)
       });
 
+      console.log('A2P Response:', { status: response.status, statusText: response.statusText });
+
       if (response.ok) {
-        addLog(`✅ A2P message sent successfully`);
+        const responseData = await response.json();
+        addLog(`✅ A2P message sent successfully - MessageId: ${responseData.messageId}`);
+        console.log('A2P Response Data:', responseData);
         const msg: Message = {
           id: Math.random().toString(36),
           timestamp: new Date().toISOString(),
@@ -209,10 +222,13 @@ export default function WebSocketTester() {
         setMessageContent('');
       } else {
         const errorText = await response.text();
-        addLog(`❌ A2P message failed: ${response.status} - ${errorText}`);
+        addLog(`❌ A2P message failed: ${response.status} ${response.statusText}`);
+        addLog(`   Error details: ${errorText}`);
+        console.error('A2P Error Response:', { status: response.status, body: errorText });
       }
     } catch (error) {
-      addLog(`❌ A2P request failed: ${error}`);
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      addLog(`❌ A2P request failed: ${errorMessage}`);
       console.error('A2P error:', error);
     }
   };
@@ -370,18 +386,23 @@ export default function WebSocketTester() {
                   <option value="fifo">FIFO (Ordered)</option>
                 </select>
               </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Priority</label>
-                <select
-                  value={priority}
-                  onChange={(e) => setPriority(e.target.value as any)}
-                  className="w-full px-3 py-2 border rounded-md text-sm"
-                >
-                  <option value="low">Low</option>
-                  <option value="normal">Normal</option>
-                  <option value="high">High</option>
-                </select>
-              </div>
+              {messageType === 'fifo' && (
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">
+                    Message Group ID <span className="text-gray-500 text-xs">(optional)</span>
+                  </label>
+                  <input
+                    type="text"
+                    value={messageGroupId}
+                    onChange={(e) => setMessageGroupId(e.target.value)}
+                    className="w-full px-3 py-2 border rounded-md text-sm"
+                    placeholder="e.g., chat-room-123"
+                  />
+                  <p className="text-xs text-gray-500 mt-1">
+                    Messages with same group ID are processed in order
+                  </p>
+                </div>
+              )}
             </div>
           </div>
         </div>
@@ -406,11 +427,17 @@ export default function WebSocketTester() {
                     } max-w-2xl shadow-sm`}
                   >
                     <div className="flex items-center justify-between mb-1">
-                      <span className={`text-xs font-semibold px-2 py-1 rounded ${
-                        msg.type === 'P2P' ? 'bg-purple-200 text-purple-800' : 'bg-green-200 text-green-800'
-                      }`}>
-                        {msg.type}
-                      </span>
+                      {msg.direction === 'sent' ? (
+                        <span className={`text-xs font-semibold px-2 py-1 rounded ${
+                          msg.type === 'P2P' ? 'bg-purple-200 text-purple-800' : 'bg-green-200 text-green-800'
+                        }`}>
+                          {msg.type}
+                        </span>
+                      ) : (
+                        <span className="text-xs font-medium text-gray-600">
+                          📨 Received
+                        </span>
+                      )}
                       <span className="text-xs text-gray-500">
                         {new Date(msg.timestamp).toLocaleTimeString()}
                       </span>
