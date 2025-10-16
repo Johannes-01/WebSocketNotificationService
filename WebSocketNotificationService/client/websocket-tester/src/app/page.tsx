@@ -69,7 +69,7 @@ export default function Home() {
           </p>
         </div>
 
-        <div className="grid md:grid-cols-2 gap-8 max-w-5xl mx-auto">
+        <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-8 max-w-7xl mx-auto">
           {/* Single Client Tester Card */}
           <Link href="/single-client" className="group">
             <div className="bg-white rounded-lg shadow-lg p-8 hover:shadow-xl transition-all duration-300 border-2 border-transparent hover:border-blue-500 h-full flex flex-col">
@@ -137,10 +137,44 @@ export default function Home() {
               </div>
             </div>
           </Link>
+
+          {/* Permissions Manager Card */}
+          <Link href="/permissions" className="group">
+            <div className="bg-white rounded-lg shadow-lg p-8 hover:shadow-xl transition-all duration-300 border-2 border-transparent hover:border-green-500 h-full flex flex-col">
+              <div className="text-5xl mb-4 text-center">🔐</div>
+              <h3 className="text-2xl font-bold text-gray-900 mb-3 text-center">
+                Permissions Manager
+              </h3>
+              <p className="text-gray-600 mb-6 flex-1">
+                Manage chat permissions for users. Grant or revoke access to chats, view existing permissions with pagination support.
+              </p>
+              <div className="space-y-2 mb-6">
+                <div className="flex items-center text-sm text-gray-700">
+                  <span className="text-green-500 mr-2">✓</span>
+                  Grant chat permissions
+                </div>
+                <div className="flex items-center text-sm text-gray-700">
+                  <span className="text-green-500 mr-2">✓</span>
+                  Revoke permissions
+                </div>
+                <div className="flex items-center text-sm text-gray-700">
+                  <span className="text-green-500 mr-2">✓</span>
+                  View permissions by user
+                </div>
+                <div className="flex items-center text-sm text-gray-700">
+                  <span className="text-green-500 mr-2">✓</span>
+                  Pagination support
+                </div>
+              </div>
+              <div className="bg-green-50 text-green-700 py-3 px-4 rounded-lg text-center font-semibold group-hover:bg-green-100 transition-colors">
+                Manage Permissions →
+              </div>
+            </div>
+          </Link>
         </div>
 
         {/* Info Section */}
-        <div className="mt-12 bg-white rounded-lg shadow-md p-6 max-w-3xl mx-auto">
+        <div className="mt-12 bg-white rounded-lg shadow-md p-6 max-w-4xl mx-auto">
           <h4 className="text-lg font-semibold text-gray-900 mb-3">Quick Guide</h4>
           <div className="space-y-3 text-sm text-gray-700">
             <div>
@@ -148,6 +182,9 @@ export default function Home() {
             </div>
             <div>
               <span className="font-medium">Multi-Client:</span> Use this when you need to simulate multiple users or test interactions between different clients. Each client can have different configurations and can send/receive messages independently.
+            </div>
+            <div>
+              <span className="font-medium">Permissions Manager:</span> Manage user access to chats. Grant permissions (admin/member/viewer roles), revoke access, and view all permissions for a specific user with pagination support.
             </div>
             <div>
               <span className="font-medium">P2P vs A2P:</span> P2P (Person-to-Person) sends messages via WebSocket with lower latency. A2P (Application-to-Person) sends via HTTP REST API and works even without an active WebSocket connection.

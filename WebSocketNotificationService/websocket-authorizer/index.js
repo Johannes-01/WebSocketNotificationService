@@ -1,5 +1,10 @@
 const { URL } = require('url');
 const { createRemoteJWKSet, jwtVerify } = require('jose');
+const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
+const { DynamoDBDocumentClient, GetCommand } = require('@aws-sdk/lib-dynamodb');
+
+const client = new DynamoDBClient({});
+const dynamoDB = DynamoDBDocumentClient.from(client);
 
 let jwksClient;
 
@@ -37,43 +42,89 @@ async function verifyToken(token) {
   }
 }
 
+/**
+ * Check if user has permission to access a specific chat
+ */
+async function hasPermission(userId, chatId) {
+  const permissionsTable = process.env.PERMISSIONS_TABLE;
+  
+  if (!permissionsTable) {
+    console.warn('PERMISSIONS_TABLE not configured - skipping authorization check');
+    return true; // Fail open if table not configured
+  }
+
+  try {
+    const result = await dynamoDB.send(new GetCommand({
+      TableName: permissionsTable,
+      Key: {
+        userId,
+        chatId,
+      },
+    }));
+
+    return !!result.Item; // User has permission if record exists
+  } catch (error) {
+    console.error(`Error checking permission for user ${userId}, chat ${chatId}:`, error);
+    return false; // Fail closed on error
+  }
+}
+
 exports.handler = async (event, context) => {
   console.log('Received event:', JSON.stringify(event, null, 2));
   console.log('Context:', JSON.stringify(context, null, 2));
   
   const token = event.queryStringParameters?.token;
-  const hubId = event.queryStringParameters?.hubId;
-  const orgId = event.queryStringParameters?.orgId;
-  const userId = event.queryStringParameters?.userId;
-  const projectId = event.queryStringParameters?.projectId; // Optional
+  const chatIds = event.queryStringParameters?.chatIds; // Comma-separated chat IDs
 
-  if (!token || !hubId || !orgId || !userId) {
-    console.log('Missing one or more of the required query parameters: token, hubId, orgId, userId');
-    generateDeny('user', event.methodArn);
+  if (!token || !chatIds) {
+    console.log('Missing required query parameters: token and chatIds');
+    return generateDeny('user', event.methodArn);
   }
 
   try {
     const decodedToken = await verifyToken(token);
     if (!decodedToken) {
       console.log('Invalid token');
-      generateDeny('user', event.methodArn);
+      return generateDeny('user', event.methodArn);
     }
 
     const cognitoUserId = decodedToken.sub;
 
     console.log(`Decoded token for cognito user ${cognitoUserId}:`, JSON.stringify(decodedToken, null, 2));
+    
+    // Authorization: Verify user has permission for each requested chatId
+    const requestedChatIds = chatIds.split(',').map(id => id.trim()).filter(id => id.length > 0);
+    
+    if (requestedChatIds.length === 0) {
+      console.log('No valid chatIds provided');
+      return generateDeny('user', event.methodArn);
+    }
+
+    // Check permissions for each chatId
+    const permissionChecks = await Promise.all(
+      requestedChatIds.map(chatId => hasPermission(cognitoUserId, chatId))
+    );
+
+    const authorizedChatIds = requestedChatIds.filter((chatId, index) => permissionChecks[index]);
+    const unauthorizedChatIds = requestedChatIds.filter((chatId, index) => !permissionChecks[index]);
+
+    if (unauthorizedChatIds.length > 0) {
+      console.log(`User ${cognitoUserId} denied access to chatIds: ${unauthorizedChatIds.join(', ')}`);
+      return generateDeny(cognitoUserId, event.methodArn);
+    }
+
+    if (authorizedChatIds.length === 0) {
+      console.log(`User ${cognitoUserId} has no authorized chatIds`);
+      return generateDeny(cognitoUserId, event.methodArn);
+    }
+
+    console.log(`User ${cognitoUserId} authorized for chatIds: ${authorizedChatIds.join(', ')}`);
+    
     const authContext = {
         cognitoUserId: cognitoUserId,
-        userId: userId,
-        hubId: hubId,
-        orgId: orgId,
+        chatIds: authorizedChatIds.join(','), // Only pass authorized chatIds
         username: decodedToken['cognito:username'] || decodedToken.username
     };
-    
-    // Add projectId only if provided
-    if (projectId) {
-      authContext.projectId = projectId;
-    }
 
     return generateAllow(cognitoUserId, event.methodArn, authContext);
   } catch (error) {

@@ -3,6 +3,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import { useAuth } from '@/contexts/AuthContext';
+import { metricsService } from '@/services/metrics';
 import ClientCard from './websocket/ClientCard';
 import ConnectionLog from './websocket/ConnectionLog';
 
@@ -13,18 +14,21 @@ export interface Message {
   type: 'P2P' | 'A2P';
   content: string;
   payload?: any;
+  latency?: number; // E2E latency in milliseconds
+  networkLatency?: number; // Processor → client latency
+  sequenceNumber?: number; // Custom consecutive sequence number
+  isOutOfOrder?: boolean; // True if sequence number is not consecutive
+  missingCount?: number; // Number of messages potentially lost
 }
 
 export interface Client {
   id: string;
-  userId: string;
-  hubId: string;
-  orgId: string;
-  projectId: string;
+  chatIds: string; // Comma-separated chat IDs for subscription
   ws: WebSocket | null;
   connected: boolean;
   messages: Message[];
   connecting: boolean;
+  lastSequenceByScope: Record<string, number>; // Track sequences per scope (chatId)
 }
 
 export default function MultiClientTester() {
@@ -33,11 +37,8 @@ export default function MultiClientTester() {
   const [clients, setClients] = useState<Client[]>([]);
   const [connectionLog, setConnectionLog] = useState<string[]>([]);
   
-  // New client form state
-  const [newClientUserId, setNewClientUserId] = useState('');
-  const [newClientHubId, setNewClientHubId] = useState('');
-  const [newClientOrgId, setNewClientOrgId] = useState('');
-  const [newClientProjectId, setNewClientProjectId] = useState('');
+  // New client form state (Phase 4: Chat-ID based)
+  const [newClientChatIds, setNewClientChatIds] = useState('');
 
   const addLog = (message: string, clientId?: string) => {
     const timestamp = new Date().toLocaleTimeString();
@@ -46,32 +47,27 @@ export default function MultiClientTester() {
   };
 
   const createClient = () => {
-    if (!newClientUserId.trim()) {
-      addLog('❌ User ID is required');
+    if (!newClientChatIds.trim()) {
+      addLog('❌ Chat IDs are required');
       return;
     }
 
     const clientId = Math.random().toString(36).substring(7);
     const newClient: Client = {
       id: clientId,
-      userId: newClientUserId,
-      hubId: newClientHubId,
-      orgId: newClientOrgId,
-      projectId: newClientProjectId,
+      chatIds: newClientChatIds,
       ws: null,
       connected: false,
       messages: [],
       connecting: false,
+      lastSequenceByScope: {}, // Initialize sequence tracking
     };
 
     setClients(prev => [...prev, newClient]);
-    addLog(`✅ Client created: ${newClientUserId}`, clientId);
+    addLog(`✅ Client created: ${newClientChatIds}`, clientId);
     
     // Reset form
-    setNewClientUserId('');
-    setNewClientHubId('');
-    setNewClientOrgId('');
-    setNewClientProjectId('');
+    setNewClientChatIds('');
   };
 
   const connectClient = async (clientId: string) => {
@@ -89,8 +85,9 @@ export default function MultiClientTester() {
         c.id === clientId ? { ...c, connecting: true } : c
       ));
 
-      const wsUrl = `${process.env.NEXT_PUBLIC_WEBSOCKET_ENDPOINT}?token=${token}&userId=${client.userId}&hubId=${client.hubId}&orgId=${client.orgId}&projectId=${client.projectId}`;
+      const wsUrl = `${process.env.NEXT_PUBLIC_WEBSOCKET_ENDPOINT}?token=${token}&chatIds=${client.chatIds}`;
       addLog(`🔌 Connecting to WebSocket...`, clientId);
+      addLog(`   Subscribing to chats: ${client.chatIds}`, clientId);
       
       const websocket = new WebSocket(wsUrl);
 
@@ -101,17 +98,104 @@ export default function MultiClientTester() {
         ));
       };
 
-      websocket.onmessage = (event) => {
+      websocket.onmessage = async (event) => {
+        const clientReceiveTime = new Date(); // Capture receive time immediately
         addLog(`📨 Received message`, clientId);
         try {
           const data = JSON.parse(event.data);
+          
+          // Track end-to-end latency if timestamps are available
+          let e2eLatency: number | undefined;
+          let networkLatency: number | undefined;
+          
+          if (data.publishTimestamp && data.processorTimestamp) {
+            const publishTime = new Date(data.publishTimestamp);
+            const processorTime = new Date(data.processorTimestamp);
+            
+            e2eLatency = clientReceiveTime.getTime() - publishTime.getTime();
+            networkLatency = clientReceiveTime.getTime() - processorTime.getTime();
+            
+            // Send metrics to the collector Lambda
+            const token = await getIdToken();
+            if (token) {
+              await metricsService.trackEndToEndLatency(
+                data.publishTimestamp,
+                data.processorTimestamp,
+                clientReceiveTime,
+                token
+              );
+            }
+            
+            addLog(`📊 Latency - E2E: ${e2eLatency}ms, Network: ${networkLatency}ms`, clientId);
+          }
+          
+          // Track sequence numbers if present
+          let sequenceNumber: number | undefined;
+          let isOutOfOrder = false;
+          let missingCount: number | undefined;
+          
+          const client = clients.find(c => c.id === clientId);
+          
+          if (data.sequenceNumber !== undefined && typeof data.sequenceNumber === 'number' && client) {
+            const currentSeq = data.sequenceNumber;
+            sequenceNumber = currentSeq;
+            
+            // Get scope from chatId (Phase 4: chat-based scoping)
+            const scope = data.chatId || 'default';
+            
+            const lastSeq = client.lastSequenceByScope[scope];
+            
+            if (lastSeq !== undefined) {
+              const expectedSeq = lastSeq + 1;
+              
+              if (currentSeq !== expectedSeq) {
+                isOutOfOrder = true;
+                missingCount = currentSeq - expectedSeq;
+                
+                if (missingCount > 0) {
+                  addLog(`⚠️ Sequence gap! Expected: ${expectedSeq}, Got: ${currentSeq}, Missing: ${missingCount}`, clientId);
+                  
+                  // Track message loss metric
+                  const token = await getIdToken();
+                  if (token) {
+                    await metricsService.trackMessageLoss(expectedSeq, currentSeq, token);
+                  }
+                } else {
+                  addLog(`⚠️ Out-of-order sequence! Expected: ${expectedSeq}, Got: ${currentSeq}`, clientId);
+                }
+              } else {
+                addLog(`✅ Sequence #${currentSeq} in order`, clientId);
+              }
+            } else {
+              addLog(`🔢 First sequence: ${currentSeq} (scope: ${scope})`, clientId);
+            }
+            
+            // Update last sequence for this scope
+            setClients(prev => prev.map(c => 
+              c.id === clientId 
+                ? { 
+                    ...c, 
+                    lastSequenceByScope: {
+                      ...c.lastSequenceByScope,
+                      [scope]: currentSeq
+                    }
+                  } 
+                : c
+            ));
+          }
+          
           const msg: Message = {
             id: Math.random().toString(36),
             timestamp: new Date().toISOString(),
             direction: 'received',
             type: 'A2P',
             content: data.content || data.payload?.content || JSON.stringify(data),
-            payload: data
+            payload: data,
+            latency: e2eLatency,
+            networkLatency: networkLatency,
+            sequenceNumber,
+            isOutOfOrder,
+            missingCount,
           };
           setClients(prev => prev.map(c => 
             c.id === clientId ? { ...c, messages: [...c.messages, msg] } : c
@@ -171,7 +255,7 @@ export default function MultiClientTester() {
     addLog('🗑️ Client removed', clientId);
   };
 
-  const sendP2PMessage = async (clientId: string, targetClass: string, targetId: string, eventType: string, content: string, messageType: string, messageGroupId?: string) => {
+  const sendP2PMessage = async (clientId: string, chatId: string, eventType: string, content: string, messageType: string, messageGroupId?: string, generateSequence?: boolean) => {
     const client = clients.find(c => c.id === clientId);
     if (!client?.ws || !client.connected) {
       addLog('❌ Not connected to WebSocket', clientId);
@@ -188,17 +272,19 @@ export default function MultiClientTester() {
       targetChannel: 'WebSocket',
       messageType,
       ...(messageType === 'fifo' && messageGroupId && { messageGroupId }),
+      ...(messageType === 'fifo' && generateSequence && { generateSequence: true }),
       payload: {
-        targetId,
-        targetClass,
+        chatId,
         eventType,
         content,
         timestamp: new Date().toISOString()
       }
     };
 
+    console.log(message);
+
     client.ws.send(JSON.stringify(message));
-    addLog(`📤 Sent P2P to ${targetClass}:${targetId}${messageType === 'fifo' && messageGroupId ? ` (group: ${messageGroupId})` : ''}`, clientId);
+    addLog(`📤 Sent P2P to chat ${chatId}${messageType === 'fifo' && messageGroupId ? ` (group: ${messageGroupId})` : ''}${messageType === 'fifo' && generateSequence ? ' [seq]' : ''}`, clientId);
 
     const msg: Message = {
       id: Math.random().toString(36),
@@ -214,7 +300,7 @@ export default function MultiClientTester() {
     ));
   };
 
-  const sendA2PMessage = async (clientId: string, targetClass: string, targetId: string, eventType: string, content: string, messageType: string, messageGroupId?: string) => {
+  const sendA2PMessage = async (clientId: string, chatId: string, eventType: string, content: string, messageType: string, messageGroupId?: string, generateSequence?: boolean) => {
     try {
       const token = await getIdToken();
       if (!token) {
@@ -237,16 +323,16 @@ export default function MultiClientTester() {
         targetChannel: 'WebSocket',
         messageType,
         ...(messageType === 'fifo' && messageGroupId && { messageGroupId }),
+        ...(messageType === 'fifo' && generateSequence && { generateSequence: true }),
         payload: {
-          targetId,
-          targetClass,
+          chatId,
           eventType,
           content,
           timestamp: new Date().toISOString()
         }
       };
 
-      addLog(`📤 Sending A2P via HTTP...${messageType === 'fifo' && messageGroupId ? ` (group: ${messageGroupId})` : ''}`, clientId);
+      addLog(`📤 Sending A2P via HTTP...${messageType === 'fifo' && messageGroupId ? ` (group: ${messageGroupId})` : ''}${messageType === 'fifo' && generateSequence ? ' [seq]' : ''}`, clientId);
       
       const response = await fetch(endpoint, {
         method: 'POST',
@@ -348,6 +434,12 @@ export default function MultiClientTester() {
               🔌 Single Client Mode
             </button>
             <button
+              onClick={() => router.push('/permissions')}
+              className="px-4 py-2 bg-green-600 text-white rounded-md hover:bg-green-700 transition-colors text-sm font-medium"
+            >
+              🔐 Permissions
+            </button>
+            <button
               onClick={handleSignOut}
               className="px-4 py-2 bg-red-600 text-white rounded-md hover:bg-red-700 transition-colors text-sm font-medium"
             >
@@ -364,49 +456,22 @@ export default function MultiClientTester() {
           <div className="space-y-3">
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-1">
-                User ID <span className="text-red-500">*</span>
+                Chat IDs (comma-separated) <span className="text-red-500">*</span>
               </label>
               <input
                 type="text"
-                value={newClientUserId}
-                onChange={(e) => setNewClientUserId(e.target.value)}
-                placeholder="e.g., user123"
+                value={newClientChatIds}
+                onChange={(e) => setNewClientChatIds(e.target.value)}
+                placeholder="chat-123,chat-456"
                 className="w-full px-3 py-2 border rounded-md text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none"
               />
-            </div>
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">Hub ID</label>
-              <input
-                type="text"
-                value={newClientHubId}
-                onChange={(e) => setNewClientHubId(e.target.value)}
-                placeholder="e.g., hub1"
-                className="w-full px-3 py-2 border rounded-md text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none"
-              />
-            </div>
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">Org ID</label>
-              <input
-                type="text"
-                value={newClientOrgId}
-                onChange={(e) => setNewClientOrgId(e.target.value)}
-                placeholder="e.g., org1"
-                className="w-full px-3 py-2 border rounded-md text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none"
-              />
-            </div>
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">Project ID</label>
-              <input
-                type="text"
-                value={newClientProjectId}
-                onChange={(e) => setNewClientProjectId(e.target.value)}
-                placeholder="e.g., project1"
-                className="w-full px-3 py-2 border rounded-md text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none"
-              />
+              <p className="text-xs text-gray-500 mt-1">
+                Subscribe to multiple chats by separating IDs with commas
+              </p>
             </div>
             <button
               onClick={createClient}
-              disabled={!newClientUserId.trim()}
+              disabled={!newClientChatIds.trim()}
               className="w-full bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700 disabled:bg-gray-300 disabled:cursor-not-allowed transition-colors font-medium"
             >
               ➕ Add Client

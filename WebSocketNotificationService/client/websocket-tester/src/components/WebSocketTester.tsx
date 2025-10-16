@@ -3,6 +3,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import { useAuth } from '@/contexts/AuthContext';
+import { metricsService } from '@/services/metrics';
 
 interface Message {
   id: string;
@@ -11,6 +12,12 @@ interface Message {
   type: 'P2P' | 'A2P';
   content: string;
   payload?: any;
+  latency?: number; // E2E latency in milliseconds
+  networkLatency?: number; // Processor → client latency
+  sequenceNumber?: number; // Sequence number (custom consecutive or SQS for display)
+  isCustomSequence?: boolean; // True if using custom consecutive sequences (gap detection), false if SQS (ordering only)
+  isOutOfOrder?: boolean; // True if sequence number is not consecutive
+  missingCount?: number; // Number of messages potentially lost
 }
 
 export default function WebSocketTester() {
@@ -21,19 +28,19 @@ export default function WebSocketTester() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [connectionLog, setConnectionLog] = useState<string[]>([]);
   
-  // Connection parameters
-  const [userId, setUserId] = useState('user123');
-  const [hubId, setHubId] = useState('hub1');
-  const [orgId, setOrgId] = useState('org1');
-  const [projectId, setProjectId] = useState('project1');
+  // Sequence tracking per scope (targetClass:targetId)
+  const [lastSequenceByScope, setLastSequenceByScope] = useState<Record<string, number>>({});
   
-  // Message parameters
-  const [targetClass, setTargetClass] = useState<'user' | 'org' | 'hub' | 'project'>('user');
-  const [targetId, setTargetId] = useState('user123');
+  // Connection parameters (Phase 4: Chat-ID based)
+  const [chatIds, setChatIds] = useState('chat-123,chat-456'); // Comma-separated list of chat IDs
+  
+  // Message parameters (Phase 4: Chat-ID based)
+  const [chatId, setChatId] = useState('chat-123'); // Target chat ID
   const [eventType, setEventType] = useState('notification');
   const [messageContent, setMessageContent] = useState('');
   const [messageType, setMessageType] = useState<'standard' | 'fifo'>('standard');
   const [messageGroupId, setMessageGroupId] = useState('');
+  const [generateSequence, setGenerateSequence] = useState(false); // Enable custom sequence numbers
   
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
@@ -58,8 +65,9 @@ export default function WebSocketTester() {
         return;
       }
 
-      const wsUrl = `${process.env.NEXT_PUBLIC_WEBSOCKET_ENDPOINT}?token=${token}&userId=${userId}&hubId=${hubId}&orgId=${orgId}&projectId=${projectId}`;
+      const wsUrl = `${process.env.NEXT_PUBLIC_WEBSOCKET_ENDPOINT}?token=${token}&chatIds=${chatIds}`;
       addLog(`🔌 Connecting to ${process.env.NEXT_PUBLIC_WEBSOCKET_ENDPOINT}...`);
+      addLog(`   Subscribing to chats: ${chatIds}`);
       
       const websocket = new WebSocket(wsUrl);
 
@@ -68,17 +76,128 @@ export default function WebSocketTester() {
         setConnected(true);
       };
 
-      websocket.onmessage = (event) => {
+      websocket.onmessage = async (event) => {
+        const clientReceiveTime = new Date(); // Capture receive time immediately
         addLog(`📨 Received message: ${event.data.substring(0, 100)}...`);
         try {
           const data = JSON.parse(event.data);
+          
+          // Track end-to-end latency if timestamps are available
+          let e2eLatency: number | undefined;
+          let networkLatency: number | undefined;
+          
+          if (data.publishTimestamp && data.processorTimestamp) {
+            const publishTime = new Date(data.publishTimestamp);
+            const processorTime = new Date(data.processorTimestamp);
+            
+            e2eLatency = clientReceiveTime.getTime() - publishTime.getTime();
+            networkLatency = clientReceiveTime.getTime() - processorTime.getTime();
+            
+            // Send metrics to the collector Lambda
+            const token = await getIdToken();
+            if (token) {
+              await metricsService.trackEndToEndLatency(
+                data.publishTimestamp,
+                data.processorTimestamp,
+                clientReceiveTime,
+                token
+              );
+            }
+            
+            addLog(`📊 Latency - E2E: ${e2eLatency}ms, Network: ${networkLatency}ms`);
+          }
+          
+          // Track sequence numbers if present
+          let sequenceNumber: number | undefined;
+          let isOutOfOrder = false;
+          let missingCount: number | undefined;
+          let isCustomSequence = false; // True if using custom consecutive sequences
+          
+          // Prioritize custom consecutive sequence, fall back to SQS sequence
+          if (data.sequenceNumber !== undefined && typeof data.sequenceNumber === 'number') {
+            const currentSeq = data.sequenceNumber; // Custom consecutive sequence (1,2,3...)
+            sequenceNumber = currentSeq;
+            isCustomSequence = true;
+            
+            // Get scope from chatId (Phase 4: chat-based scoping)
+            const scope = data.chatId || 'default';
+            
+            const lastSeq = lastSequenceByScope[scope];
+            
+            if (lastSeq !== undefined) {
+              const expectedSeq = lastSeq + 1;
+              
+              if (currentSeq !== expectedSeq) {
+                isOutOfOrder = true;
+                missingCount = currentSeq - expectedSeq;
+                
+                if (missingCount > 0) {
+                  addLog(`⚠️ Sequence gap detected! Expected: ${expectedSeq}, Got: ${currentSeq}, Missing: ${missingCount}`);
+                  
+                  // Track message loss metric
+                  const token = await getIdToken();
+                  if (token) {
+                    await metricsService.trackMessageLoss(expectedSeq, currentSeq, token);
+                  }
+                } else {
+                  addLog(`⚠️ Out-of-order sequence! Expected: ${expectedSeq}, Got: ${currentSeq}`);
+                }
+              } else {
+                addLog(`✅ Sequence #${currentSeq} in order`);
+              }
+            } else {
+              addLog(`🔢 First sequence number received: ${currentSeq} (scope: ${scope})`);
+            }
+            
+            // Update last sequence for this scope
+            setLastSequenceByScope(prev => ({
+              ...prev,
+              [scope]: currentSeq
+            }));
+          } else if (data.sqsSequenceNumber !== undefined && typeof data.sqsSequenceNumber === 'string') {
+            // SQS sequence (non-consecutive) - only for ordering verification, not gap detection
+            const currentSqsSeq = BigInt(data.sqsSequenceNumber);
+            sequenceNumber = parseInt(data.sqsSequenceNumber.slice(-6)); // Show last 6 digits for display
+            isCustomSequence = false;
+            
+            const scope = data.chatId || 'default';
+            
+            const lastSeq = lastSequenceByScope[scope];
+            
+            if (lastSeq !== undefined) {
+              const lastSqsSeq = BigInt(lastSeq);
+              
+              // Only check ordering (higher = later), not gaps
+              if (currentSqsSeq < lastSqsSeq) {
+                isOutOfOrder = true;
+                addLog(`⚠️ Out-of-order delivery! SQS sequence decreased`);
+              } else {
+                addLog(`✅ SQS sequence in order (ordering only)`);
+              }
+            } else {
+              addLog(`🔢 First SQS sequence received (scope: ${scope})`);
+            }
+            
+            // Store the BigInt as string for comparison
+            setLastSequenceByScope(prev => ({
+              ...prev,
+              [scope]: Number(currentSqsSeq)
+            }));
+          }
+          
           const msg: Message = {
             id: Math.random().toString(36),
             timestamp: new Date().toISOString(),
             direction: 'received',
             type: 'A2P',
             content: data.content || data.payload?.content || JSON.stringify(data),
-            payload: data
+            payload: data,
+            latency: e2eLatency,
+            networkLatency: networkLatency,
+            sequenceNumber,
+            isCustomSequence,
+            isOutOfOrder,
+            missingCount,
           };
           setMessages(prev => [...prev, msg]);
         } catch (e) {
@@ -135,9 +254,9 @@ export default function WebSocketTester() {
       targetChannel: 'WebSocket',
       messageType,
       ...(messageType === 'fifo' && messageGroupId && { messageGroupId }),
+      ...(messageType === 'fifo' && generateSequence && { generateSequence: true }),
       payload: {
-        targetId,
-        targetClass,
+        chatId,
         eventType,
         content: messageContent,
         timestamp: new Date().toISOString()
@@ -145,7 +264,7 @@ export default function WebSocketTester() {
     };
 
     ws.send(JSON.stringify(message));
-    addLog(`📤 Sent P2P message to ${targetClass}:${targetId}${messageType === 'fifo' && messageGroupId ? ` (group: ${messageGroupId})` : ''}`);
+    addLog(`📤 Sent P2P message to chat ${chatId}${messageType === 'fifo' && messageGroupId ? ` (group: ${messageGroupId})` : ''}${messageType === 'fifo' && generateSequence ? ' [seq]' : ''}`);
 
     const msg: Message = {
       id: Math.random().toString(36),
@@ -183,16 +302,16 @@ export default function WebSocketTester() {
         targetChannel: 'WebSocket',
         messageType,
         ...(messageType === 'fifo' && messageGroupId && { messageGroupId }),
+        ...(messageType === 'fifo' && generateSequence && { generateSequence: true }),
         payload: {
-          targetId,
-          targetClass,
+          chatId,
           eventType,
           content: messageContent,
           timestamp: new Date().toISOString()
         }
       };
 
-      addLog(`📤 Sending A2P message via HTTP to ${endpoint}...${messageType === 'fifo' && messageGroupId ? ` (group: ${messageGroupId})` : ''}`);
+      addLog(`📤 Sending A2P message via HTTP to ${endpoint}...${messageType === 'fifo' && messageGroupId ? ` (group: ${messageGroupId})` : ''}${messageType === 'fifo' && generateSequence ? ' [seq]' : ''}`);
       console.log('A2P Request:', { endpoint, message, token: `${token.substring(0, 20)}...` });
       
       const response = await fetch(endpoint, {
@@ -280,6 +399,12 @@ export default function WebSocketTester() {
               🔌 Multi-Client Mode
             </button>
             <button
+              onClick={() => router.push('/permissions')}
+              className="px-4 py-2 bg-green-600 text-white rounded-md hover:bg-green-700 transition-colors text-sm font-medium"
+            >
+              🔐 Permissions
+            </button>
+            <button
               onClick={handleSignOut}
               className="px-4 py-2 bg-red-600 text-white rounded-md hover:bg-red-700 transition-colors text-sm font-medium"
             >
@@ -297,44 +422,20 @@ export default function WebSocketTester() {
             <h2 className="text-lg font-semibold mb-3 text-gray-900">Connection</h2>
             <div className="space-y-3">
               <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">User ID</label>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  Chat IDs (comma-separated)
+                </label>
                 <input
                   type="text"
-                  value={userId}
-                  onChange={(e) => setUserId(e.target.value)}
+                  value={chatIds}
+                  onChange={(e) => setChatIds(e.target.value)}
                   className="w-full px-3 py-2 border rounded-md text-sm"
+                  placeholder="chat-123,chat-456"
                   disabled={connected}
                 />
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Hub ID</label>
-                <input
-                  type="text"
-                  value={hubId}
-                  onChange={(e) => setHubId(e.target.value)}
-                  className="w-full px-3 py-2 border rounded-md text-sm"
-                  disabled={connected}
-                />
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Org ID</label>
-                <input
-                  type="text"
-                  value={orgId}
-                  onChange={(e) => setOrgId(e.target.value)}
-                  className="w-full px-3 py-2 border rounded-md text-sm"
-                  disabled={connected}
-                />
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Project ID</label>
-                <input
-                  type="text"
-                  value={projectId}
-                  onChange={(e) => setProjectId(e.target.value)}
-                  className="w-full px-3 py-2 border rounded-md text-sm"
-                  disabled={connected}
-                />
+                <p className="text-xs text-gray-500 mt-1">
+                  Subscribe to multiple chats by separating IDs with commas
+                </p>
               </div>
               
               {!connected ? (
@@ -360,27 +461,19 @@ export default function WebSocketTester() {
             <h2 className="text-lg font-semibold mb-3 text-gray-900">Message Settings</h2>
             <div className="space-y-3">
               <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Target Class</label>
-                <select
-                  value={targetClass}
-                  onChange={(e) => setTargetClass(e.target.value as any)}
-                  className="w-full px-3 py-2 border rounded-md text-sm"
-                >
-                  <option value="user">User</option>
-                  <option value="org">Organization</option>
-                  <option value="hub">Hub</option>
-                  <option value="project">Project</option>
-                </select>
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Target ID</label>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  Target Chat ID
+                </label>
                 <input
                   type="text"
-                  value={targetId}
-                  onChange={(e) => setTargetId(e.target.value)}
+                  value={chatId}
+                  onChange={(e) => setChatId(e.target.value)}
                   className="w-full px-3 py-2 border rounded-md text-sm"
-                  placeholder="e.g., user123"
+                  placeholder="chat-123"
                 />
+                <p className="text-xs text-gray-500 mt-1">
+                  Send message to this chat
+                </p>
               </div>
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">Event Type</label>
@@ -404,21 +497,46 @@ export default function WebSocketTester() {
                 </select>
               </div>
               {messageType === 'fifo' && (
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">
-                    Message Group ID <span className="text-gray-500 text-xs">(optional)</span>
-                  </label>
-                  <input
-                    type="text"
-                    value={messageGroupId}
-                    onChange={(e) => setMessageGroupId(e.target.value)}
-                    className="w-full px-3 py-2 border rounded-md text-sm"
-                    placeholder="e.g., chat-room-123"
-                  />
-                  <p className="text-xs text-gray-500 mt-1">
-                    Messages with same group ID are processed in order
-                  </p>
-                </div>
+                <>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">
+                      Message Group ID <span className="text-gray-500 text-xs">(optional)</span>
+                    </label>
+                    <input
+                      type="text"
+                      value={messageGroupId}
+                      onChange={(e) => setMessageGroupId(e.target.value)}
+                      className="w-full px-3 py-2 border rounded-md text-sm"
+                      placeholder="e.g., chat-room-123"
+                    />
+                    <p className="text-xs text-gray-500 mt-1">
+                      Messages with same group ID are processed in order
+                    </p>
+                  </div>
+                  
+                  <div className="flex items-center space-x-2 p-3 bg-blue-50 border border-blue-200 rounded-md">
+                    <input
+                      type="checkbox"
+                      id="generateSequence"
+                      checked={generateSequence}
+                      onChange={(e) => setGenerateSequence(e.target.checked)}
+                      className="w-4 h-4 text-blue-600 rounded focus:ring-blue-500"
+                    />
+                    <label htmlFor="generateSequence" className="text-sm font-medium text-gray-700 cursor-pointer flex-1">
+                      Generate Sequence Numbers
+                    </label>
+                  </div>
+                  {generateSequence && (
+                    <div className="p-3 bg-yellow-50 border border-yellow-200 rounded-md">
+                      <p className="text-xs text-yellow-800">
+                        <strong>⚠️ Performance Note:</strong> Custom sequence generation adds ~50-100ms latency per message due to DynamoDB atomic counter.
+                      </p>
+                      <p className="text-xs text-yellow-700 mt-1">
+                        <strong>✅ Benefits:</strong> Gap detection, message loss tracking, completeness validation.
+                      </p>
+                    </div>
+                  )}
+                </>
               )}
             </div>
           </div>
@@ -451,15 +569,60 @@ export default function WebSocketTester() {
                           {msg.type}
                         </span>
                       ) : (
-                        <span className="text-xs font-medium text-gray-600">
-                          📨 Received
-                        </span>
+                        <div className="flex items-center gap-2">
+                          <span className="text-xs font-medium text-gray-600">
+                            📨 Received
+                          </span>
+                          {msg.latency !== undefined && (
+                            <span className={`text-xs px-2 py-0.5 rounded font-medium ${
+                              msg.latency < 500 ? 'bg-green-100 text-green-700' :
+                              msg.latency < 1000 ? 'bg-yellow-100 text-yellow-700' :
+                              'bg-red-100 text-red-700'
+                            }`}>
+                              ⚡ {msg.latency}ms
+                            </span>
+                          )}
+                        </div>
                       )}
                       <span className="text-xs text-gray-500">
                         {new Date(msg.timestamp).toLocaleTimeString()}
                       </span>
                     </div>
                     <div className="text-sm text-gray-900">{msg.content}</div>
+                    
+                    {/* Sequence number display */}
+                    {msg.sequenceNumber !== undefined && (
+                      <div className={`mt-1 text-xs font-medium flex items-center gap-2 ${
+                        msg.isOutOfOrder 
+                          ? 'text-red-600' 
+                          : 'text-blue-600'
+                      }`}>
+                        <span>
+                          🔢 {msg.isCustomSequence ? 'Seq' : 'SQS'}: {msg.sequenceNumber}
+                          {msg.isCustomSequence && <span className="text-green-600 ml-1" title="Consecutive sequence - gap detection enabled">●</span>}
+                          {!msg.isCustomSequence && <span className="text-orange-500 ml-1" title="SQS sequence - ordering only">○</span>}
+                        </span>
+                        {msg.isOutOfOrder && msg.missingCount !== undefined && msg.missingCount > 0 && (
+                          <span className="px-2 py-0.5 bg-red-100 text-red-700 rounded">
+                            ⚠️ Gap: {msg.missingCount} missing
+                          </span>
+                        )}
+                        {msg.isOutOfOrder && msg.missingCount !== undefined && msg.missingCount <= 0 && (
+                          <span className="px-2 py-0.5 bg-orange-100 text-orange-700 rounded">
+                            ⚠️ Out of order
+                          </span>
+                        )}
+                        {!msg.isOutOfOrder && (
+                          <span className="text-green-600">✓</span>
+                        )}
+                      </div>
+                    )}
+                    
+                    {msg.networkLatency !== undefined && (
+                      <div className="mt-1 text-xs text-gray-600">
+                        Network: {msg.networkLatency}ms
+                      </div>
+                    )}
                     {msg.payload && (
                       <details className="mt-2">
                         <summary className="text-xs text-gray-600 cursor-pointer">View payload</summary>
@@ -491,13 +654,13 @@ export default function WebSocketTester() {
                 disabled={!connected}
                 className="px-6 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 disabled:bg-gray-300 disabled:cursor-not-allowed transition-colors font-medium"
               >
-                📤 P2P
+                📤 P2P{messageType === 'fifo' && generateSequence && ' 🔢'}
               </button>
               <button
                 onClick={sendA2PMessage}
                 className="px-6 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors font-medium"
               >
-                📡 A2P
+                📡 A2P{messageType === 'fifo' && generateSequence && ' 🔢'}
               </button>
               <button
                 onClick={clearMessages}
@@ -509,6 +672,16 @@ export default function WebSocketTester() {
             <div className="mt-2 text-xs text-gray-600">
               <span className="font-semibold">P2P:</span> Send via WebSocket (requires connection) |{' '}
               <span className="font-semibold">A2P:</span> Send via HTTP API (no connection needed)
+              {messageType === 'fifo' && generateSequence && (
+                <span className="ml-2 text-blue-600 font-semibold">
+                  | 🔢 Custom Sequences <span className="text-green-600">●</span> (Gap detection enabled)
+                </span>
+              )}
+              {messageType === 'fifo' && !generateSequence && (
+                <span className="ml-2 text-orange-600 font-semibold">
+                  | SQS Sequences <span className="text-orange-500">○</span> (Ordering only)
+                </span>
+              )}
             </div>
           </div>
         </div>

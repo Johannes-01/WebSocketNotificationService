@@ -86,6 +86,8 @@ export class WebSocketNotificationService extends cdk.Stack {
         maxReceiveCount: 3,
         queue: webSocketFifoDlq,
       },
+      deduplicationScope: sqs.DeduplicationScope.MESSAGE_GROUP,
+      fifoThroughputLimit: sqs.FifoThroughputLimit.PER_MESSAGE_GROUP_ID,
     });
 
     // SQS Standard Queue to buffer WebSocket messages for the processor (high-throughput, reliable)
@@ -116,9 +118,88 @@ export class WebSocketNotificationService extends cdk.Stack {
       },
     }));
 
+    // ============================================
+    // Message Storage Queue & Lambda
+    // Stores all messages persistently for later retrieval
+    // ============================================
+    const messageStorageQueue = new sqs.Queue(this, 'MessageStorageQueue', {
+      queueName: `${stackName}-MessageStorageQueue`,
+      visibilityTimeout: cdk.Duration.seconds(60),
+    });
+
+    // Subscribe storage queue to BOTH SNS topics (all messages regardless of type)
+    notificationFifoTopic.addSubscription(new subscription.SqsSubscription(messageStorageQueue, {
+      filterPolicy: {
+        targetChannel: sns.SubscriptionFilter.stringFilter({
+          allowlist: ['WebSocket'],
+        }),
+      },
+      rawMessageDelivery: false, // Keep SNS envelope for metadata
+    }));
+
+    notificationTopic.addSubscription(new subscription.SqsSubscription(messageStorageQueue, {
+      filterPolicy: {
+        targetChannel: sns.SubscriptionFilter.stringFilter({
+          allowlist: ['WebSocket'],
+        }),
+      },
+      rawMessageDelivery: false,
+    }));
+
     const connectionTable = new dynamodb.Table(this, 'ConnectionTable', {
       partitionKey: { name: 'connectionId', type: dynamodb.AttributeType.STRING },
       removalPolicy: cdk.RemovalPolicy.DESTROY, // Use RETAIN in production
+    });
+
+    // GSI for Chat-ID based routing (supports multiple chat IDs per connection)
+    connectionTable.addGlobalSecondaryIndex({
+      indexName: 'ChatIdIndex',
+      partitionKey: {
+        name: 'chatId',
+        type: dynamodb.AttributeType.STRING,
+      },
+    });
+
+    // Sequence counter table for custom consecutive sequence numbers
+    const sequenceTable = new dynamodb.Table(this, 'SequenceCounterTable', {
+      partitionKey: { name: 'scope', type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      removalPolicy: cdk.RemovalPolicy.DESTROY, // Use RETAIN in production
+    });
+
+    // Message Storage Table for persistent message history (30 days retention)
+    const messageStorageTable = new dynamodb.Table(this, 'MessageStorageTable', {
+      partitionKey: { name: 'chatId', type: dynamodb.AttributeType.STRING },
+      sortKey: { name: 'timestamp', type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      timeToLiveAttribute: 'ttl',
+      removalPolicy: cdk.RemovalPolicy.DESTROY, // Use RETAIN in production
+    });
+
+    // GSI for sequence-based queries (optional - for efficient gap detection)
+    messageStorageTable.addGlobalSecondaryIndex({
+      indexName: 'SequenceIndex',
+      partitionKey: { name: 'chatId', type: dynamodb.AttributeType.STRING },
+      sortKey: { name: 'sequenceNumber', type: dynamodb.AttributeType.NUMBER },
+    });
+
+    // ============================================
+    // User Chat Permissions Table
+    // Stores user permissions for chat access
+    // ============================================
+    const userChatPermissionsTable = new dynamodb.Table(this, 'UserChatPermissionsTable', {
+      tableName: `${stackName}-UserChatPermissions`,
+      partitionKey: { name: 'userId', type: dynamodb.AttributeType.STRING },
+      sortKey: { name: 'chatId', type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      removalPolicy: cdk.RemovalPolicy.DESTROY, // Use RETAIN in production
+    });
+
+    // GSI for reverse lookup: which users have access to a chat
+    userChatPermissionsTable.addGlobalSecondaryIndex({
+      indexName: 'ChatIdIndex',
+      partitionKey: { name: 'chatId', type: dynamodb.AttributeType.STRING },
+      sortKey: { name: 'userId', type: dynamodb.AttributeType.STRING },
     });
 
     const webSocketAuthFunction = new lambda.Function(this, 'WebSocketAuthorizerFunction', {
@@ -129,9 +210,13 @@ export class WebSocketNotificationService extends cdk.Stack {
         CONNECTION_TABLE: connectionTable.tableName,
         USER_POOL_CLIENT_ID: userPoolClient.userPoolClientId,
         JWKS_URI: `https://cognito-idp.${cdk.Aws.REGION}.amazonaws.com/${userPool.userPoolId}/.well-known/jwks.json`,
+        PERMISSIONS_TABLE: userChatPermissionsTable.tableName,
       },
       timeout: cdk.Duration.seconds(10),
     });
+
+    // Grant read permissions to check user access
+    userChatPermissionsTable.grantReadData(webSocketAuthFunction);
 
     // this is a lambda request authorizer for WebSocket API
    const websocketLambdaAuthorizer = new cdk.aws_apigatewayv2_authorizers.WebSocketLambdaAuthorizer('WebSocketAuthorizer', webSocketAuthFunction, {
@@ -153,39 +238,8 @@ export class WebSocketNotificationService extends cdk.Stack {
       },
     });
 
-    connectionTable.addGlobalSecondaryIndex({
-      indexName: 'UserIndex',
-      partitionKey: {
-        name: 'userId',
-        type: dynamodb.AttributeType.STRING,
-      },
-    });
-
-    connectionTable.addGlobalSecondaryIndex({
-      indexName: 'OrgIndex',
-      partitionKey: {
-        name: 'orgId',
-        type: dynamodb.AttributeType.STRING,
-      },
-    });
-
-    connectionTable.addGlobalSecondaryIndex({
-      indexName: 'HubIndex',
-      partitionKey: {
-        name: 'hubId',
-        type: dynamodb.AttributeType.STRING,
-      },
-    });
-
-    connectionTable.addGlobalSecondaryIndex({
-      indexName: 'ProjectIndex',
-      partitionKey: {
-        name: 'projectId',
-        type: dynamodb.AttributeType.STRING,
-      },
-    });
-
-    connectionTable.grantWriteData(connectionHandler);
+    // Grant read+write permissions for connect (write) and disconnect (scan+delete)
+    connectionTable.grantReadWriteData(connectionHandler);
 
     const LambdaIntegration = new integrations.WebSocketLambdaIntegration(
       'ConnectionHandlerIntegration',
@@ -212,12 +266,16 @@ export class WebSocketNotificationService extends cdk.Stack {
       environment: {
         FIFO_TOPIC_ARN: notificationFifoTopic.topicArn,
         STANDARD_TOPIC_ARN: notificationTopic.topicArn,
+        SEQUENCE_TABLE: sequenceTable.tableName,
       },
       timeout: cdk.Duration.seconds(10),
+      reservedConcurrentExecutions: 1,
+      tracing: lambda.Tracing.ACTIVE,
     });
 
     notificationFifoTopic.grantPublish(p2pWebSocketPublisher);
     notificationTopic.grantPublish(p2pWebSocketPublisher);
+    sequenceTable.grantReadWriteData(p2pWebSocketPublisher);
 
     webSocketApi.addRoute('$default', {
       integration: new integrations.WebSocketLambdaIntegration(
@@ -264,10 +322,11 @@ export class WebSocketNotificationService extends cdk.Stack {
       description: 'HTTP API for publishing notifications (A2P)',
       deployOptions: {
         stageName: 'dvl',
+        tracingEnabled: true,
       },
       defaultCorsPreflightOptions: {
         allowOrigins: apigateway.Cors.ALL_ORIGINS,
-        allowMethods: ['POST', 'OPTIONS'],
+        allowMethods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
         allowHeaders: [
           'Content-Type',
           'Authorization',
@@ -289,12 +348,16 @@ export class WebSocketNotificationService extends cdk.Stack {
       environment: {
       FIFO_TOPIC_ARN: notificationFifoTopic.topicArn,
       STANDARD_TOPIC_ARN: notificationTopic.topicArn,
+      SEQUENCE_TABLE: sequenceTable.tableName,
       },
       timeout: cdk.Duration.seconds(10),
+      reservedConcurrentExecutions: 1,
+      tracing: lambda.Tracing.ACTIVE,
     });
 
     notificationFifoTopic.grantPublish(a2pHttpPublisher);
     notificationTopic.grantPublish(a2pHttpPublisher);
+    sequenceTable.grantReadWriteData(a2pHttpPublisher);
     
     const cognitoAuthorizer = new apigateway.CognitoUserPoolsAuthorizer(this, 'CognitoAuthorizer', {
       cognitoUserPools: [userPool],
@@ -325,18 +388,19 @@ export class WebSocketNotificationService extends cdk.Stack {
         WS_API_ENDPOINT: WebSocketApiStage.url.replace('wss://', 'https://'),
       },
       timeout: cdk.Duration.seconds(60),
-      reservedConcurrentExecutions: 10,
+      reservedConcurrentExecutions: 1,
+      tracing: lambda.Tracing.ACTIVE,
     });
 
     // SQS event source for FIFO messages (ordered, deduplicated)
     processorLambda.addEventSource(new SqsEventSource(webSocketFifoQueue, {
-      batchSize: 5,
+      batchSize: 1,
       reportBatchItemFailures: true,
     }));
 
     // SQS event source for Standard messages (high-throughput, reliable)
     processorLambda.addEventSource(new SqsEventSource(webSocketStandardQueue, {
-      batchSize: 10, // Higher batch size for standard queue for better throughput
+      batchSize: 1, // Higher batch size for standard queue for better throughput
       reportBatchItemFailures: true,
     }));
 
@@ -352,20 +416,145 @@ export class WebSocketNotificationService extends cdk.Stack {
       ],
     }));
 
-    // CloudWatch Alarm for ProcessorLambda Errors
-    const processorErrorAlarm = new cloudwatch.Alarm(this, 'ProcessorErrorAlarm', {
-      metric: processorLambda.metricErrors({
-        period: cdk.Duration.minutes(1),
-      }),
-      threshold: 1,
-      evaluationPeriods: 1,
-      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
-      alarmDescription: 'Alarm if the ProcessorLambda fails one or more times in a 1 minute period.',
-      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+    // ============================================
+    // Message Storage Lambda
+    // Stores messages in DynamoDB for later retrieval
+    // ============================================
+    const messageStorageLambda = new lambda.Function(this, 'MessageStorageLambda', {
+      functionName: `${stackName}-MessageStorage`,
+      runtime: lambda.Runtime.NODEJS_22_X,
+      handler: 'index.handler',
+      code: lambda.Code.fromAsset('../message-storage-handler'),
+      environment: {
+        MESSAGE_STORAGE_TABLE: messageStorageTable.tableName,
+      },
+      timeout: cdk.Duration.seconds(30),
+      reservedConcurrentExecutions: 5,
     });
 
+    // SQS event source for message storage
+    messageStorageLambda.addEventSource(new SqsEventSource(messageStorageQueue, {
+      batchSize: 10,
+      reportBatchItemFailures: true,
+    }));
+
+    messageStorageTable.grantWriteData(messageStorageLambda);
+
+    // ============================================
+    // Message Retrieval API
+    // REST endpoint for clients to fetch message history
+    // ============================================
+    const messageRetrievalLambda = new lambda.Function(this, 'MessageRetrievalLambda', {
+      functionName: `${stackName}-MessageRetrieval`,
+      runtime: lambda.Runtime.NODEJS_22_X,
+      handler: 'index.handler',
+      code: lambda.Code.fromAsset('../message-retrieval-handler'),
+      environment: {
+        MESSAGE_STORAGE_TABLE: messageStorageTable.tableName,
+        PERMISSIONS_TABLE: userChatPermissionsTable.tableName,
+      },
+      timeout: cdk.Duration.seconds(10),
+    });
+
+    messageStorageTable.grantReadData(messageRetrievalLambda);
+    userChatPermissionsTable.grantReadData(messageRetrievalLambda);
+
+    // Add /messages endpoint to REST API
+    const messagesResource = notificationApi.root.addResource('messages');
+    messagesResource.addMethod('GET',
+      new apigateway.LambdaIntegration(messageRetrievalLambda),
+      {
+        authorizer: cognitoAuthorizer,
+        authorizationType: apigateway.AuthorizationType.COGNITO,
+        requestParameters: {
+          'method.request.querystring.chatId': true,
+          'method.request.querystring.limit': false,
+          'method.request.querystring.startKey': false,
+          'method.request.querystring.fromTimestamp': false,
+          'method.request.querystring.toTimestamp': false,
+        },
+      }
+    );
+
+    // ============================================
+    // Permission Management API
+    // REST endpoints for managing chat permissions
+    // ============================================
+    const chatPermissionLambda = new lambda.Function(this, 'ChatPermissionLambda', {
+      functionName: `${stackName}-ChatPermission`,
+      runtime: lambda.Runtime.NODEJS_22_X,
+      handler: 'index.handler',
+      code: lambda.Code.fromAsset('../chat-permission-handler'),
+      environment: {
+        PERMISSIONS_TABLE: userChatPermissionsTable.tableName,
+      },
+      timeout: cdk.Duration.seconds(10),
+    });
+
+    userChatPermissionsTable.grantReadWriteData(chatPermissionLambda);
+
+    // Add /permissions endpoint to REST API
+    const permissionsResource = notificationApi.root.addResource('permissions');
+    
+    // POST /permissions - Grant permission
+    permissionsResource.addMethod('POST',
+      new apigateway.LambdaIntegration(chatPermissionLambda),
+      {
+        authorizer: cognitoAuthorizer,
+        authorizationType: apigateway.AuthorizationType.COGNITO,
+      }
+    );
+
+    // DELETE /permissions - Revoke permission
+    permissionsResource.addMethod('DELETE',
+      new apigateway.LambdaIntegration(chatPermissionLambda),
+      {
+        authorizer: cognitoAuthorizer,
+        authorizationType: apigateway.AuthorizationType.COGNITO,
+        requestParameters: {
+          'method.request.querystring.userId': true,
+          'method.request.querystring.chatId': true,
+        },
+      }
+    );
+
+    // GET /permissions - List permissions
+    permissionsResource.addMethod('GET',
+      new apigateway.LambdaIntegration(chatPermissionLambda),
+      {
+        authorizer: cognitoAuthorizer,
+        authorizationType: apigateway.AuthorizationType.COGNITO,
+        requestParameters: {
+          'method.request.querystring.userId': false,
+        },
+      }
+    );
+
+    // ===========================================================
+    // ===== Metric Collector Lambda =====
+    // Collects client-side metrics for end-to-end latency tracking
+    // ===========================================================
+    const metricCollectorLambda = new lambda.Function(this, 'MetricCollectorLambda', {
+      functionName: `${stackName}-MetricCollector`,
+      runtime: lambda.Runtime.NODEJS_22_X,
+      code: lambda.Code.fromAsset('../metric-collector'),
+      handler: 'index.handler',
+      timeout: cdk.Duration.seconds(10),
+      logRetention: logs.RetentionDays.ONE_WEEK,
+    });
+
+    // Add /metrics endpoint to REST API
+    const metricsResource = notificationApi.root.addResource('metrics');
+    metricsResource.addMethod('POST', 
+      new apigateway.LambdaIntegration(metricCollectorLambda),
+      {
+        authorizer: cognitoAuthorizer,
+        authorizationType: apigateway.AuthorizationType.COGNITO,
+      }
+    );
+
     // CloudWatch Alarm for ProcessorLambda Duration (P90)
-    const p95LatencyAlarm = new cloudwatch.Alarm(this, 'P95LatencyAlarm', {
+    /*const p95LatencyAlarm = new cloudwatch.Alarm(this, 'P95LatencyAlarm', {
       metric: processorLambda.metricDuration({
         period: cdk.Duration.minutes(5),
         statistic: 'p95',
@@ -375,22 +564,22 @@ export class WebSocketNotificationService extends cdk.Stack {
       comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
       alarmDescription: 'Alarm if the 95th percentile latency exceeds 500 Milliseconds over a 5 minute period.',
       treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
-    });
+    });*/
 
     // High Latency Count Alarm (count of messages over threshold)
     const highLatencyCountFilter = processorLambda.logGroup.addMetricFilter('HighLatencyCountFilter', {
       filterPattern: logs.FilterPattern.all(
         logs.FilterPattern.exists('$.event_type'),
         logs.FilterPattern.stringValue('$.event_type', '=', 'latency_measurement'),
-        logs.FilterPattern.numberValue('$.latency_seconds', '>', 3)
-      ), // Messages over 3 seconds
+        logs.FilterPattern.numberValue('$.latency_ms', '>', 1000)
+      ), // Messages over 1000ms (1 second)
       metricName: 'HighLatencyMessageCount',
       metricNamespace: 'NotificationService',
       metricValue: '1', // Count each occurrence
       unit: cloudwatch.Unit.COUNT,
     });
 
-    const highLatencyCountAlarm = new cloudwatch.Alarm(this, 'HighLatencyCountAlarm', {
+    /*const highLatencyCountAlarm = new cloudwatch.Alarm(this, 'HighLatencyCountAlarm', {
       metric: highLatencyCountFilter.metric({
         period: cdk.Duration.minutes(5),
         statistic: 'Sum',
@@ -400,25 +589,26 @@ export class WebSocketNotificationService extends cdk.Stack {
       comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
       alarmDescription: 'Alarm if more than 10 messages exceed 3 seconds latency in a 5 minute period.',
       treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
-    });
+    });*/
 
-    // Metric Filter to extract latency from structured JSON logs
-    const latencyMetricFilter = processorLambda.logGroup.addMetricFilter('LatencyMetricFilter', {
+    // Metric Filter to extract Publisher → Processor latency from structured JSON logs
+    // This measures the time from when a message is published until it reaches the processor Lambda
+    const latencyMetricFilter = processorLambda.logGroup.addMetricFilter('PublisherToProcessorLatencyFilter', {
       // Filter only logs that contain latency measurements
       filterPattern: logs.FilterPattern.all(
         logs.FilterPattern.exists('$.event_type'),
         logs.FilterPattern.stringValue('$.event_type', '=', 'latency_measurement'),
-        logs.FilterPattern.exists('$.latency_seconds')
+        logs.FilterPattern.exists('$.latency_ms')
       ),
-      metricName: 'MessageLatency',
+      metricName: 'PublisherToProcessorLatency',
       metricNamespace: 'NotificationService',
-      metricValue: '$.latency_seconds',
+      metricValue: '$.latency_ms',
       unit: cloudwatch.Unit.MILLISECONDS,
       defaultValue: 0, // Important: provides default value when no logs match
     });
 
     // CloudWatch Alarm for Average Latency
-    const averageLatencyAlarm = new cloudwatch.Alarm(this, 'AverageLatencyAlarm', {
+    /*const averageLatencyAlarm = new cloudwatch.Alarm(this, 'AverageLatencyAlarm', {
       metric: latencyMetricFilter.metric({
         period: cdk.Duration.minutes(5),
         statistic: 'Average',
@@ -429,16 +619,17 @@ export class WebSocketNotificationService extends cdk.Stack {
       comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
       alarmDescription: 'Alarm if the average message latency exceeds 2 seconds over consecutive 5 minute periods.',
       treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
-    });
+    });*/
 
     // Action for the alarms: notify the SNS topic
-    const snsAction = new cloudwatch_actions.SnsAction(notificationFifoTopic);
-    processorErrorAlarm.addAlarmAction(snsAction);
-    p95LatencyAlarm.addAlarmAction(snsAction);
-    averageLatencyAlarm.addAlarmAction(snsAction);
-    highLatencyCountAlarm.addAlarmAction(snsAction);
+    // const snsAction = new cloudwatch_actions.SnsAction(notificationFifoTopic);
+    // processorErrorAlarm.addAlarmAction(snsAction);
+    // p95LatencyAlarm.addAlarmAction(snsAction);
+    // averageLatencyAlarm.addAlarmAction(snsAction);
+    // highLatencyCountAlarm.addAlarmAction(snsAction);
 
 
+    // ===== CloudWatch Dashboard =====
     const latencyDashboard = new cloudwatch.Dashboard(this, 'LatencyDashboard', {
       dashboardName: 'NotificationService-Latency',
     })
@@ -447,38 +638,156 @@ export class WebSocketNotificationService extends cdk.Stack {
       period: cdk.Duration.minutes(1),
     });
 
-      latencyDashboard.addWidgets(
-        // Average latency over time
-        new cloudwatch.GraphWidget({
-          title: 'Message Latency - Average',
-          left: [latencyMetric.with({ statistic: 'Average' })],
-          period: cdk.Duration.minutes(1),
-          width: 12,
-          height: 6,
-          leftYAxis: {
-            min: 0,
-            label: 'Seconds',
-          },
-          view: cloudwatch.GraphWidgetView.TIME_SERIES,
-        }),
-    
-        // Latency percentiles
-        new cloudwatch.GraphWidget({
-          title: 'Message Latency - Percentiles',
-          left: [
-            latencyMetric.with({ statistic: 'p50', label: 'p50' }),
-            latencyMetric.with({ statistic: 'p95', label: 'p95' }),
-            latencyMetric.with({ statistic: 'p99', label: 'p99' }),
-            latencyMetric.with({ statistic: 'Maximum', label: 'Max' }),
-          ],
-          period: cdk.Duration.minutes(1),
-          width: 12,
-          height: 6,
-          leftYAxis: {
-            min: 0,
-            label: 'Seconds',
-          },
-        }),
+    // Client-side metric filters
+    const clientE2ELatencyFilter = metricCollectorLambda.logGroup.addMetricFilter('ClientE2ELatencyFilter', {
+      filterPattern: logs.FilterPattern.all(
+        logs.FilterPattern.exists('$.metric_name'),
+        logs.FilterPattern.stringValue('$.metric_name', '=', 'EndToEndLatency'),
+      ),
+      metricName: 'ClientEndToEndLatency',
+      metricNamespace: 'NotificationService/Client',
+      metricValue: '$.metric_value',
+      unit: cloudwatch.Unit.MILLISECONDS,
+    });
+
+    const clientNetworkLatencyFilter = metricCollectorLambda.logGroup.addMetricFilter('ClientNetworkLatencyFilter', {
+      filterPattern: logs.FilterPattern.all(
+        logs.FilterPattern.exists('$.metric_name'),
+        logs.FilterPattern.stringValue('$.metric_name', '=', 'NetworkLatency'),
+      ),
+      metricName: 'ClientNetworkLatency',
+      metricNamespace: 'NotificationService/Client',
+      metricValue: '$.metric_value',
+      unit: cloudwatch.Unit.MILLISECONDS,
+    });
+
+    const clientJitterFilter = metricCollectorLambda.logGroup.addMetricFilter('ClientJitterFilter', {
+      filterPattern: logs.FilterPattern.all(
+        logs.FilterPattern.exists('$.metric_name'),
+        logs.FilterPattern.stringValue('$.metric_name', '=', 'Jitter'),
+      ),
+      metricName: 'ClientJitter',
+      metricNamespace: 'NotificationService/Client',
+      metricValue: '$.metric_value',
+      unit: cloudwatch.Unit.MILLISECONDS,
+    });
+
+    latencyDashboard.addWidgets(
+      // PRIMARY: End-to-End Latency Percentiles (Publisher → Client)
+      // This is the most important metric for user experience
+      new cloudwatch.GraphWidget({
+        title: 'End-to-End Latency (Publisher → Client) - Percentiles',
+        left: [
+          clientE2ELatencyFilter.metric().with({ statistic: 'p50', label: 'P50 (Median)', color: '#2CA02C' }),
+          clientE2ELatencyFilter.metric().with({ statistic: 'p90', label: 'P90', color: '#FF7F0E' }),
+          clientE2ELatencyFilter.metric().with({ statistic: 'p95', label: 'P95', color: '#D62728' }),
+          clientE2ELatencyFilter.metric().with({ statistic: 'p99', label: 'P99', color: '#9467BD' }),
+        ],
+        width: 24,
+        height: 6,
+        leftYAxis: {
+          label: 'Milliseconds',
+          min: 0,
+        },
+        view: cloudwatch.GraphWidgetView.TIME_SERIES,
+      }),
+
+      // Latency Breakdown: Component Comparison
+      new cloudwatch.GraphWidget({
+        title: 'Latency Breakdown: Publisher→Processor vs Processor→Client',
+        left: [
+          latencyMetric.with({ 
+            statistic: 'Average', 
+            label: 'Publisher→Processor (Avg)',
+            color: '#FF9900',
+          }),
+          clientNetworkLatencyFilter.metric().with({ 
+            statistic: 'Average', 
+            label: 'Processor→Client (Avg)',
+            color: '#1F77B4',
+          }),
+          clientE2ELatencyFilter.metric().with({ 
+            statistic: 'Average', 
+            label: 'Total E2E (Avg)',
+            color: '#2CA02C',
+          }),
+        ],
+        period: cdk.Duration.minutes(1),
+        width: 12,
+        height: 6,
+        leftYAxis: {
+          label: 'Milliseconds',
+          min: 0,
+        },
+      }),
+
+      // E2E Latency Statistics (Avg, Min, Max)
+      new cloudwatch.GraphWidget({
+        title: 'End-to-End Latency - Average & Extremes',
+        left: [
+          clientE2ELatencyFilter.metric().with({ statistic: 'Average', label: 'Average', color: '#1F77B4' }),
+          clientE2ELatencyFilter.metric().with({ statistic: 'Minimum', label: 'Minimum', color: '#2CA02C' }),
+          clientE2ELatencyFilter.metric().with({ statistic: 'Maximum', label: 'Maximum', color: '#D62728' }),
+        ],
+        width: 12,
+        height: 6,
+        leftYAxis: {
+          label: 'Milliseconds',
+          min: 0,
+        },
+      }),
+
+      // Publisher → Processor Latency Percentiles (for debugging)
+      new cloudwatch.GraphWidget({
+        title: 'Publisher → Processor Latency - Percentiles',
+        left: [
+          latencyMetric.with({ statistic: 'p50', label: 'P50', color: '#2CA02C' }),
+          latencyMetric.with({ statistic: 'p90', label: 'P90', color: '#FF7F0E' }),
+          latencyMetric.with({ statistic: 'p95', label: 'P95', color: '#D62728' }),
+          latencyMetric.with({ statistic: 'p99', label: 'P99', color: '#9467BD' }),
+        ],
+        period: cdk.Duration.minutes(1),
+        width: 12,
+        height: 6,
+        leftYAxis: {
+          min: 0,
+          label: 'Milliseconds',
+        },
+      }),
+
+      // Network Latency Percentiles (Processor → Client)
+      new cloudwatch.GraphWidget({
+        title: 'Network Latency (Processor → Client) - Percentiles',
+        left: [
+          clientNetworkLatencyFilter.metric().with({ statistic: 'p50', label: 'P50', color: '#2CA02C' }),
+          clientNetworkLatencyFilter.metric().with({ statistic: 'p90', label: 'P90', color: '#FF7F0E' }),
+          clientNetworkLatencyFilter.metric().with({ statistic: 'p95', label: 'P95', color: '#D62728' }),
+          clientNetworkLatencyFilter.metric().with({ statistic: 'p99', label: 'P99', color: '#9467BD' }),
+        ],
+        width: 12,
+        height: 6,
+        leftYAxis: {
+          label: 'Milliseconds',
+          min: 0,
+        },
+      }),
+
+      // Jitter
+      new cloudwatch.GraphWidget({
+        title: 'Latency Jitter - Percentiles',
+        left: [
+          clientJitterFilter.metric().with({ statistic: 'p50', label: 'P50 Jitter', color: '#2CA02C' }),
+          clientJitterFilter.metric().with({ statistic: 'p90', label: 'P90 Jitter', color: '#FF7F0E' }),
+          clientJitterFilter.metric().with({ statistic: 'p95', label: 'P95 Jitter', color: '#D62728' }),
+        ],
+        width: 12,
+        height: 6,
+        leftYAxis: {
+          label: 'Milliseconds',
+          min: 0,
+          showUnits: true,
+        },
+      }),
     
       // Message throughput and high latency count
       new cloudwatch.GraphWidget({
@@ -491,15 +800,17 @@ export class WebSocketNotificationService extends cdk.Stack {
         leftYAxis: {
           min: 0,
           label: 'Count',
+          showUnits: true,
         },
         rightYAxis: {
           min: 0,
           label: 'High Latency Count',
+          showUnits: true,
         },
       }),
     
       // Alarm status
-      new cloudwatch.SingleValueWidget({
+      /*new cloudwatch.SingleValueWidget({
         title: 'Alarm Status',
         metrics: [
           averageLatencyAlarm.metric,
@@ -508,7 +819,25 @@ export class WebSocketNotificationService extends cdk.Stack {
         ],
         width: 12,
         height: 3,
-      })
+      })*/
     );
+
+    // ============================================
+    // CloudFormation Outputs
+    // ============================================
+    new cdk.CfnOutput(this, 'PermissionsTableName', {
+      value: userChatPermissionsTable.tableName,
+      description: 'DynamoDB table for user chat permissions',
+    });
+
+    new cdk.CfnOutput(this, 'PermissionsApiUrl', {
+      value: notificationApi.url + 'permissions',
+      description: 'REST API endpoint for permission management',
+    });
+
+    new cdk.CfnOutput(this, 'MessageRetrievalApiUrl', {
+      value: notificationApi.url + 'messages',
+      description: 'REST API endpoint for message retrieval',
+    });
   }
 }

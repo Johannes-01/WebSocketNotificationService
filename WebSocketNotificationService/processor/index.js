@@ -15,16 +15,26 @@ const VALIDITY_WINDOW_MILLISECONDS = 10000; // 10 seconds
 // Processes a single message from the SQS queue
 const processRecord = async (record) => {
   console.log('Processing SQS record:', record.messageId);
+  console.log('SQS record attributes:', JSON.stringify(record.attributes));
 
   // 1. Parse the message body (SQS wraps SNS message)
   const snsMessage = JSON.parse(record.body);
   const message = JSON.parse(snsMessage.Message);
 
+  // Extract SQS metadata for frontend tracking
+  const sqsMetadata = {
+    sequenceNumber: record.attributes?.SequenceNumber || null,      // FIFO sequence number (null for standard queue)
+    messageGroupId: record.attributes?.MessageGroupId || null,      // FIFO message group (null for standard queue)
+    sqsMessageId: record.messageId,                                 // SQS message ID
+    approximateReceiveCount: record.attributes?.ApproximateReceiveCount || '1',
+  };
+  
+  console.log('Extracted SQS metadata:', JSON.stringify(sqsMetadata));
+
   /**
    * Expected message structure from both P2P and A2P publishers:
    * {
-   *   "targetId": "abc123xyz",
-   *   "targetClass": "user", // user, org, hub, project
+   *   "chatId": "chat-123",          // Target chat ID
    *   "eventType": "notification",
    *   "content": "Message content",
    *   "publishTimestamp": "2025-10-03T14:00:00Z"
@@ -32,17 +42,15 @@ const processRecord = async (record) => {
    */
 
   const {
-    targetId,
-    targetClass,
+    chatId,
     publishTimestamp,
     ...messagePayload
   } = message;
 
   // 2. Validate required fields
-  if (!targetId || !targetClass || !publishTimestamp) {
+  if (!chatId || !publishTimestamp) {
     console.error('Invalid message structure. Missing required fields:', {
-      targetId,
-      targetClass,
+      chatId,
       publishTimestamp,
       message
     });
@@ -55,12 +63,13 @@ const processRecord = async (record) => {
 
   console.log(JSON.stringify({
     event_type: 'latency_measurement',
-    latency_seconds: parseFloat((latency / 1000).toFixed(5)),
+    latency_ms: latency, // Publisher → Processor latency in milliseconds
     message_id: snsMessage.MessageId,
+    sequence_number: sqsMetadata.sequenceNumber,
+    message_group_id: sqsMetadata.messageGroupId,
     timestamp: new Date().toISOString(),
     publish_timestamp: publishTimestamp,
-    target_class: targetClass,
-    target_id: targetId
+    chat_id: chatId
   }));
 
   // 4. Check message expiration
@@ -69,73 +78,70 @@ const processRecord = async (record) => {
     return; // Stop processing this record
   }
 
-  // 5. Find connections for the target
-  const indexNameMap = { 
-    user: 'UserIndex', 
-    org: 'OrgIndex', 
-    hub: 'HubIndex',
-    project: 'ProjectIndex'
-  };
-  const indexName = indexNameMap[targetClass];
-  const attributeName = targetClass === 'user' ? 'userId' : `${targetClass}Id`;
-  
-  if (!indexName) {
-    console.error(`Unsupported targetClass: ${targetClass}. Must be 'user', 'org', 'hub', or 'project'.`);
-    return;
-  }
-
+  // 5. Find connections for the chat ID using ChatIdIndex GSI
   const queryCommand = new QueryCommand({
     TableName: CONNECTION_TABLE,
-    IndexName: indexName,
-    KeyConditionExpression: `#attrName = :attrValue`,
-    ExpressionAttributeNames: { '#attrName': attributeName },
-    ExpressionAttributeValues: { ':attrValue': targetId },
+    IndexName: 'ChatIdIndex',
+    KeyConditionExpression: 'chatId = :chatId',
+    ExpressionAttributeValues: { ':chatId': chatId },
   });
 
   const connections = await docClient.send(queryCommand);
   if (!connections.Items || connections.Items.length === 0) {
-    console.log(`No active connections found for ${targetClass}:${targetId}.`);
+    console.log(`No active connections found for chatId: ${chatId}.`);
     return;
   }
 
-  console.log(`Found ${connections.Items.length} active connection(s) for ${targetClass}:${targetId}.`);
+  console.log(`Found ${connections.Items.length} active connection(s) for chatId: ${chatId}.`);
 
   // 6. Send message to all found connections
-  const promises = connections.Items.map(async ({ connectionId }) => {
+  const promises = connections.Items.map(async (item) => {
+    const actualConnectionId = item.actualConnectionId; // The real WebSocket connection ID
     try {
+      const processorTimestamp = new Date().toISOString();
+      
       // Send the full message including metadata to WebSocket client
+      // Preserve custom sequenceNumber from payload (consecutive 1,2,3...) if it exists
       const dataToSend = JSON.stringify({
         ...messagePayload,
-        targetId,
-        targetClass,
+        chatId,
         publishTimestamp,
-        receivedTimestamp: new Date().toISOString(),
-        latencyMs: latency
+        processorTimestamp,                                // When processor sent the message (for E2E latency tracking)
+        receivedTimestamp: processorTimestamp,             // Deprecated: use processorTimestamp
+        latencyMs: latency,
+        // SQS metadata for frontend ordering and gap detection
+        // messagePayload.sequenceNumber is the CUSTOM consecutive sequence (1,2,3...) - keep it!
+        sqsSequenceNumber: sqsMetadata.sequenceNumber,     // SQS sequence (non-consecutive, for ordering only)
+        messageGroupId: sqsMetadata.messageGroupId,        // Scope of the sequence
+        messageId: sqsMetadata.sqsMessageId,               // Unique message identifier
+        retryCount: parseInt(sqsMetadata.approximateReceiveCount) - 1, // 0 for first delivery
       });
 
+      console.log(`Sending message to connection ${actualConnectionId}:`, dataToSend);
+
       await apiGateway.send(new PostToConnectionCommand({
-        ConnectionId: connectionId,
+        ConnectionId: actualConnectionId,
         Data: dataToSend,
       }));
       
-      console.log(`Message sent successfully to connection ${connectionId}`);
+      console.log(`Message sent successfully to connection ${actualConnectionId}`);
     } catch (err) {
       // If the connection is gone (410 Gone), delete it from the table
       if (err.statusCode === 410 || err.$metadata?.httpStatusCode === 410) {
-        console.log(`Stale connection detected (410 Gone). Deleting connection: ${connectionId}`);
+        console.log(`Stale connection detected (410 Gone). Deleting connection record: ${item.connectionId}`);
         await docClient.send(new DeleteCommand({
           TableName: CONNECTION_TABLE,
-          Key: { connectionId },
+          Key: { connectionId: item.connectionId }, // Delete the composite key record
         }));
       } else {
-        console.error(`Error sending to connection ${connectionId}:`, err);
+        console.error(`Error sending to connection ${actualConnectionId}:`, err);
         throw err; // Re-throw to trigger SQS retry
       }
     }
   });
 
   await Promise.all(promises);
-  console.log(`Finished processing message for ${targetClass}:${targetId}`);
+  console.log(`Finished processing message for chatId: ${chatId}`);
 };
 
 exports.handler = async (event) => {

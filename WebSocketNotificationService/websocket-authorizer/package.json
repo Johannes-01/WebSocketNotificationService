@@ -2,6 +2,8 @@
   "type": "commonjs",
   "dependencies": {
     "jose": "^4.14.4",
-    "url": "^0.11.4"
+    "url": "^0.11.4",
+    "@aws-sdk/client-dynamodb": "^3.700.0",
+    "@aws-sdk/lib-dynamodb": "^3.700.0"
   }
 }

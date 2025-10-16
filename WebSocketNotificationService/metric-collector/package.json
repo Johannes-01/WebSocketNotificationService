@@ -1,0 +1,7 @@
+{
+  "name": "metric-collector",
+  "version": "1.0.0",
+  "description": "Lambda function to collect client-side metrics",
+  "main": "index.js",
+  "dependencies": {}
+}

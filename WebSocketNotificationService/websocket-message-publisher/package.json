@@ -4,7 +4,9 @@
   "description": "Handles incoming WebSocket messages and publishes them to SNS.",
   "main": "index.js",
   "dependencies": {
-    "@aws-sdk/client-sns": "^3.583.0",
+    "@aws-sdk/client-dynamodb": "^3.830.0",
+    "@aws-sdk/client-sns": "^3.830.0",
+    "@aws-sdk/lib-dynamodb": "^3.830.0",
     "uuid": "^9.0.1"
   }
 }

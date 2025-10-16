@@ -1,13 +1,38 @@
 const { SNSClient, PublishCommand } = require('@aws-sdk/client-sns');
+const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
+const { DynamoDBDocumentClient, UpdateCommand } = require('@aws-sdk/lib-dynamodb');
 
 const sns = new SNSClient({});
+const dynamoClient = new DynamoDBClient({});
+const docClient = DynamoDBDocumentClient.from(dynamoClient);
+
+const SEQUENCE_TABLE = process.env.SEQUENCE_TABLE;
+
+/**
+ * Get next consecutive sequence number for a scope using atomic DynamoDB counter
+ * @param {string} scope - Scope identifier (e.g., "user:123:chat")
+ * @returns {Promise<number>} Next sequence number
+ */
+async function getNextSequence(scope) {
+    const command = new UpdateCommand({
+        TableName: SEQUENCE_TABLE,
+        Key: { scope },
+        UpdateExpression: 'ADD #seq :inc',
+        ExpressionAttributeNames: { '#seq': 'sequence' },
+        ExpressionAttributeValues: { ':inc': 1 },
+        ReturnValues: 'UPDATED_NEW',
+    });
+    
+    const result = await docClient.send(command);
+    return result.Attributes.sequence;
+}
 
 exports.handler = async (event) => {
     try {
         console.log('Received WebSocket event:', JSON.stringify(event, null, 2));
 
         // Extract authenticated user ID from WebSocket authorizer context
-        const cognitoUserId = event.requestContext?.authorizer?.userId;
+        const cognitoUserId = event.requestContext?.authorizer?.cognitoUserId;
         
         if (!cognitoUserId) {
             console.error('No authenticated user found in WebSocket context');
@@ -38,16 +63,25 @@ exports.handler = async (event) => {
             "action": "sendMessage", // WebSocket action (handled by $default route)
             "targetChannel": "WebSocket", // WebSocket, Email, SMS, etc.
             "messageType": "fifo", // "fifo" or "standard" (optional, defaults to "standard")
-            "messageGroupId": "chat-room-456", // Optional: for FIFO grouping (defaults to userId)
+            "messageGroupId": "chat-123", // Optional: for FIFO grouping (defaults to chatId)
+            "generateSequence": true, // Optional: only for FIFO, generates DynamoDB sequence
             "payload": {
-                "targetId": "abc123xyz",
-                "targetClass": "user", // user, org, hub, project
+                "chatId": "chat-123",      // Target chat ID
                 "eventType": "notification",
-                "content": "Message content"
+                "content": "Message content",
+                "customSequence": { // Optional: client can provide their own sequence
+                    "number": 42,
+                    "scope": "chat-123"
+                },
+                "multiPartMetadata": { // Optional: for tracking multi-part messages
+                    "groupId": "file-upload-xyz",
+                    "totalParts": 5,
+                    "partNumber": 1
+                }
             }
          }
          */
-        const { targetChannel, payload, messageType = 'standard', messageGroupId } = messageBody;
+        const { targetChannel, payload, messageType = 'standard', messageGroupId, generateSequence } = messageBody;
 
         if (!targetChannel || !payload) {
             console.error('Missing required parameters in body');
@@ -79,6 +113,34 @@ exports.handler = async (event) => {
             publishTimestamp: publishTimestamp,
         };
 
+        // Handle custom sequence numbers (only for FIFO messages)
+        if (messageType === 'fifo') {
+            // Option 1: Client provides their own sequence (pass through)
+            if (payload.customSequence) {
+                messageToPublish.customSequence = payload.customSequence;
+                console.log(`Using client-provided sequence: ${payload.customSequence.number} for scope ${payload.customSequence.scope}`);
+            }
+            // Option 2: Client requests Lambda to generate sequence (opt-in)
+            else if (generateSequence) {
+                const scope = payload.chatId; // Use chatId as scope
+                try {
+                    const customSeq = await getNextSequence(scope);
+                    messageToPublish.sequenceNumber = customSeq;
+                    console.log(`Generated sequence ${customSeq} for chatId ${scope}`);
+                } catch (error) {
+                    console.error('Failed to generate sequence, continuing without it:', error);
+                    // Continue without sequence - non-critical
+                }
+            }
+            // Option 3: No sequence (fastest, default)
+        }
+
+        // Pass through multiPartMetadata if provided (for multi-part message completeness checking)
+        if (payload.multiPartMetadata) {
+            messageToPublish.multiPartMetadata = payload.multiPartMetadata;
+            console.log(`Multi-part message: ${payload.multiPartMetadata.groupId} (part ${payload.multiPartMetadata.partNumber}/${payload.multiPartMetadata.totalParts})`);
+        }
+
         // Select topic based on messageType
         const topicArn = messageType === 'fifo' 
             ? process.env.FIFO_TOPIC_ARN 
@@ -102,10 +164,10 @@ exports.handler = async (event) => {
 
         // Add FIFO-specific parameters only for FIFO topics
         if (messageType === 'fifo') {
-            // Use user-provided messageGroupId or fallback to userId for safe default
-            const groupId = messageGroupId || cognitoUserId;
+            // Use user-provided messageGroupId or fallback to chatId for logical grouping
+            const groupId = messageGroupId || payload.chatId;
             publishParams.MessageGroupId = groupId;
-            console.log(`Using MessageGroupId: ${groupId} (${messageGroupId ? 'user-provided' : 'auto-generated from userId'})`);
+            console.log(`Using MessageGroupId: ${groupId} (${messageGroupId ? 'user-provided' : 'auto-generated from chatId'})`);
             // MessageDeduplicationId is not needed due to ContentBasedDeduplication on the topic
         }
 
