@@ -2,8 +2,6 @@
 
 This document describes all supported message structures for publishing to the WebSocket Notification Service.
 
----
-
 ## Table of Contents
 1. [Base Message Structure](#base-message-structure)
 2. [Publishing Methods](#publishing-methods)
@@ -25,13 +23,14 @@ All messages share a common structure with required and optional fields.
 {
   "targetChannel": string,     // "WebSocket", "Email", "SMS" (currently only WebSocket is processed)
   "payload": {
-    "targetId": string,        // ID of the recipient (user ID, org ID, hub ID, etc.)
-    "targetClass": string,     // "user", "org", "hub", "project"
+    "chatId": string,          // Chat ID (required for permission checking)
     "eventType": string,       // Application-defined event type
     "content": any             // Message content (string, object, array)
   }
 }
 ```
+
+**Note**: The `chatId` field is now **required** in the payload for permission verification. Users must have permission to send messages to the specified chat.
 
 ### Optional Fields (Top-Level)
 
@@ -80,17 +79,17 @@ All messages share a common structure with required and optional fields.
   "targetChannel": "WebSocket",              // Required
   "messageType": "standard",                 // Optional: "standard" or "fifo"
   "messageGroupId": "chat-room-123",         // Optional: FIFO grouping
+  "generateSequence": true,                  // Optional: FIFO only - generates DynamoDB sequence
   "payload": {
-    "targetId": "user-456",
-    "targetClass": "user",
+    "chatId": "chat-123",                    // Required: Chat ID for routing and permissions
     "eventType": "chat",
-    "content": "Hello!",
-    "requestSequence": true                  // Optional: FIFO auto-includes this
+    "content": "Hello!"
   }
 }
 ```
 
-**Authentication**: User ID extracted from WebSocket authorizer context
+**Authentication**: User ID extracted from WebSocket authorizer context  
+**Authorization**: User must have permission to send to the specified `chatId`
 
 ---
 
@@ -104,17 +103,17 @@ All messages share a common structure with required and optional fields.
   "targetChannel": "WebSocket",              // Required
   "messageType": "fifo",                     // Optional: "standard" or "fifo"
   "messageGroupId": "notification-group",    // Optional: FIFO grouping
+  "generateSequence": true,                  // Optional: FIFO only - generates DynamoDB sequence
   "payload": {
-    "targetId": "user-123",
-    "targetClass": "user",
+    "chatId": "chat-123",                    // Required: Chat ID for routing and permissions
     "eventType": "notification",
-    "content": "Your order has shipped!",
-    "requestSequence": true                  // Optional: FIFO auto-includes this
+    "content": "Your order has shipped!"
   }
 }
 ```
 
-**Authentication**: `Authorization: Bearer ${COGNITO_JWT_TOKEN}`
+**Authentication**: `Authorization: Bearer ${COGNITO_JWT_TOKEN}`  
+**Authorization**: User must have permission to send to the specified `chatId`
 
 ---
 
@@ -136,8 +135,7 @@ All messages share a common structure with required and optional fields.
   "targetChannel": "WebSocket",
   "messageType": "standard",
   "payload": {
-    "targetId": "user-123",
-    "targetClass": "user",
+    "chatId": "chat-123",
     "eventType": "notification",
     "content": "New message in your inbox"
   }
@@ -165,8 +163,7 @@ All messages share a common structure with required and optional fields.
   "messageType": "fifo",
   "messageGroupId": "chat-room-456",
   "payload": {
-    "targetId": "user-123",
-    "targetClass": "user",
+    "chatId": "chat-room-456",
     "eventType": "chat",
     "content": "Message in order"
   }
@@ -197,8 +194,7 @@ Transaction logs    → Sort by sequenceNumber (guaranteed correctness)
 {
   "messageType": "standard",
   "payload": {
-    "targetId": "user-123",
-    "targetClass": "user",
+    "chatId": "chat-123",
     "eventType": "notification",
     "content": "Fast message"
   }
@@ -213,18 +209,17 @@ Transaction logs    → Sort by sequenceNumber (guaranteed correctness)
 ```json
 {
   "messageType": "fifo",
+  "generateSequence": true,
   "payload": {
-    "targetId": "user-123",
-    "targetClass": "user",
+    "chatId": "chat-123",
     "eventType": "chat",
-    "content": "Ordered message",
-    "requestSequence": true  // Auto-included for FIFO messages
+    "content": "Ordered message"
   }
 }
 ```
 **Result**: Lambda generates consecutive DynamoDB sequence (1,2,3...), ~100-170ms  
 **Use Case**: Chat, transaction logs - gap detection enabled  
-**Note**: FIFO messages automatically include `requestSequence: true`
+**Note**: Set `generateSequence: true` at the top level to enable
 
 ---
 
@@ -233,13 +228,12 @@ Transaction logs    → Sort by sequenceNumber (guaranteed correctness)
 {
   "messageType": "fifo",
   "payload": {
-    "targetId": "user-123",
-    "targetClass": "user",
+    "chatId": "chat-123",
     "eventType": "chat",
     "content": "Client tracked message",
     "customSequence": {
       "number": 42,
-      "scope": "user:123:chat"
+      "scope": "chat-123"
     }
   }
 }
@@ -258,8 +252,7 @@ For messages split into multiple parts (e.g., file uploads, large payloads).
 {
   "messageType": "fifo",
   "payload": {
-    "targetId": "user-123",
-    "targetClass": "user",
+    "chatId": "chat-123",
     "eventType": "file-upload",
     "content": "Binary chunk data...",
     "multiPartMetadata": {
@@ -325,8 +318,7 @@ Control the ordering scope for FIFO messages.
   "messageType": "fifo",
   "messageGroupId": "project-updates-proj123",
   "payload": {
-    "targetId": "org-456",
-    "targetClass": "org",
+    "chatId": "project-123",
     "eventType": "project-update",
     "content": "Project status changed"
   }
@@ -334,8 +326,8 @@ Control the ordering scope for FIFO messages.
 ```
 
 **Default Behavior**:
-- P2P: Uses authenticated user's Cognito ID
-- A2P: Uses authenticated user's Cognito ID
+- P2P: Uses `chatId` from payload
+- A2P: Uses `chatId` from payload
 
 **Custom Behavior**:
 - Use any string as grouping key
@@ -381,9 +373,10 @@ This service offers three optional tracking mechanisms. Here's when to use each:
 ```json
 {
   "messageType": "fifo",
+  "generateSequence": true,
   "payload": { 
-    "content": "Trackable message",
-    "requestSequence": true  // Auto-included for FIFO
+    "chatId": "chat-123",
+    "content": "Trackable message"
   }
 }
 ```
@@ -391,7 +384,7 @@ This service offers three optional tracking mechanisms. Here's when to use each:
 ✅ **Latency**: ~100-170ms (+15ms for DynamoDB sequence generation)  
 ✅ **Client gets**: Consecutive sequences (1,2,3...) for gap detection  
 ✅ **Can detect**: "Got 1,2,4 → missing 3!"  
-**Note**: All FIFO messages automatically request sequences
+**Note**: Set `generateSequence: true` to enable sequence generation
 
 ---
 
@@ -420,9 +413,10 @@ This service offers three optional tracking mechanisms. Here's when to use each:
 ```json
 {
   "messageType": "fifo",
+  "generateSequence": true,
   "payload": {
+    "chatId": "chat-123",
     "content": "File chunk",
-    "requestSequence": true,  // Auto-included for FIFO
     "multiPartMetadata": {
       "groupId": "file-upload-xyz",
       "totalParts": 5,
@@ -435,7 +429,7 @@ This service offers three optional tracking mechanisms. Here's when to use each:
 ✅ **Latency**: ~100-170ms  
 ✅ **Client gets**: Both consecutive sequences AND part tracking  
 ✅ **Can detect**: Missing sequences AND missing parts  
-**Note**: FIFO automatically includes sequence generation
+**Note**: Set `generateSequence: true` to enable sequence generation
 
 ---
 
@@ -444,11 +438,11 @@ This service offers three optional tracking mechanisms. Here's when to use each:
 | Your Need | Solution | Latency | Example Use Case |
 |-----------|----------|---------|------------------|
 | Just send it | Standard | ~50-100ms | "User logged in" alert |
-| Keep order | FIFO (auto-sequences) | ~100-170ms | Status updates, chat |
-| Detect gaps | FIFO (auto-sequences) | ~100-170ms | Chat messages |
+| Keep order | FIFO (with generateSequence) | ~100-170ms | Status updates, chat |
+| Detect gaps | FIFO (with generateSequence) | ~100-170ms | Chat messages |
 | Track parts | Standard + multiPartMetadata | ~50-100ms | Single file upload |
 | Multiple uploads | Standard + multiPartMetadata | ~50-100ms | User uploads 3 files at once |
-| Critical file transfer | FIFO + multiPart | ~100-170ms | Mission-critical data chunks |
+| Critical file transfer | FIFO + generateSequence + multiPart | ~100-170ms | Mission-critical data chunks |
 
 ---
 
@@ -459,8 +453,7 @@ This service offers three optional tracking mechanisms. Here's when to use each:
 {
   "targetChannel": "WebSocket",
   "payload": {
-    "targetId": "user-123",
-    "targetClass": "user",
+    "chatId": "chat-123",
     "eventType": "notification",
     "content": "You have a new follower!"
   }
@@ -478,12 +471,11 @@ This service offers three optional tracking mechanisms. Here's when to use each:
   "targetChannel": "WebSocket",
   "messageType": "fifo",
   "messageGroupId": "chat-room-789",
+  "generateSequence": true,
   "payload": {
-    "targetId": "user-456",
-    "targetClass": "user",
+    "chatId": "chat-room-789",
     "eventType": "chat",
-    "content": "Hello everyone!",
-    "requestSequence": true  // Auto-included for FIFO
+    "content": "Hello everyone!"
   }
 }
 ```
@@ -500,19 +492,18 @@ This service offers three optional tracking mechanisms. Here's when to use each:
 {
   "targetChannel": "WebSocket",
   "messageType": "fifo",
+  "generateSequence": true,
   "payload": {
-    "targetId": "user-123",
-    "targetClass": "user",
+    "chatId": "chat-123",
     "eventType": "task-update",
-    "content": "Task #5 completed",
-    "requestSequence": true  // Auto-included for FIFO
+    "content": "Task #5 completed"
   }
 }
 ```
 **Delivery Time**: ~100-170ms  
-**Ordering**: Guaranteed per user-123  
+**Ordering**: Guaranteed per chat-123  
 **Sequences**: Custom sequence generated (consecutive, gap-detectable)  
-**Note**: FIFO messages automatically request sequences
+**Note**: Set `generateSequence: true` to enable sequence generation
 
 ---
 
@@ -526,8 +517,7 @@ This service offers three optional tracking mechanisms. Here's when to use each:
   "targetChannel": "WebSocket",
   "messageType": "fifo",
   "payload": {
-    "targetId": "user-123",
-    "targetClass": "user",
+    "chatId": "chat-123",
     "eventType": "file-chunk",
     "content": "base64-encoded-chunk-data...",
     "multiPartMetadata": {
@@ -541,6 +531,7 @@ This service offers three optional tracking mechanisms. Here's when to use each:
 // File B, chunk 1 (can be sent simultaneously)
 {
   "payload": {
+    "chatId": "chat-123",
     "multiPartMetadata": {
       "groupId": "file-upload-B",
       "totalParts": 2,
@@ -557,8 +548,9 @@ This service offers three optional tracking mechanisms. Here's when to use each:
 ```json
 {
   "messageType": "fifo",
+  "generateSequence": true,
   "payload": {
-    "requestSequence": true,  // ← Auto-included for FIFO
+    "chatId": "chat-123",
     "multiPartMetadata": { ... }
   }
 }
@@ -572,8 +564,7 @@ This service offers three optional tracking mechanisms. Here's when to use each:
 {
   "targetChannel": "WebSocket",
   "payload": {
-    "targetId": "org-456",
-    "targetClass": "org",
+    "chatId": "org-456",
     "eventType": "announcement",
     "content": {
       "title": "System Maintenance",
@@ -585,7 +576,7 @@ This service offers three optional tracking mechanisms. Here's when to use each:
 ```
 **Delivery Time**: ~50-100ms  
 **Ordering**: None  
-**Target**: All users in org-456
+**Target**: All users subscribed to org-456 chat
 
 ---
 
@@ -595,13 +586,12 @@ This service offers three optional tracking mechanisms. Here's when to use each:
   "targetChannel": "WebSocket",
   "messageType": "fifo",
   "payload": {
-    "targetId": "user-789",
-    "targetClass": "user",
+    "chatId": "chat-789",
     "eventType": "game-update",
     "content": "Player moved to position (10, 20)",
     "customSequence": {
       "number": 1523,
-      "scope": "user:789:game-session-123"
+      "scope": "chat-789:game-session-123"
     }
   }
 }
@@ -614,75 +604,40 @@ This service offers three optional tracking mechanisms. Here's when to use each:
 
 ## Target Classes
 
-### User
-Target individual users by their user ID.
+### Chat-Based Routing (Current Implementation)
+
+The notification service now uses **chat-based routing** where messages are delivered to all users who have active WebSocket connections subscribed to a specific chat.
 
 ```json
 {
   "payload": {
-    "targetId": "user-123",
-    "targetClass": "user",
-    "eventType": "notification",
-    "content": "Personal message"
+    "chatId": "chat-123",
+    "eventType": "message",
+    "content": "Message content"
   }
 }
 ```
 
-**Routing**: Delivered to all active WebSocket connections for user-123
+**Routing**: Delivered to all active WebSocket connections subscribed to `chat-123`  
+**Permission Check**: User must have permission entry in the permissions table for `chat-123`
 
----
+### Permission System
 
-### Organization
-Target all users in an organization.
+Before publishing a message (via either A2P or P2P), the system checks if the authenticated user has permission to send to the specified `chatId`:
 
-```json
-{
-  "payload": {
-    "targetId": "org-456",
-    "targetClass": "org",
-    "eventType": "announcement",
-    "content": "Organization-wide message"
-  }
-}
-```
+**Permission Table Structure**:
+- Primary Key: `userId` (Cognito user ID)
+- Sort Key: `chatId` 
+- Permission exists if record is present
 
-**Routing**: Delivered to all active connections in org-456
+**Authorization Flow**:
+1. User authenticates (Cognito JWT token)
+2. User sends message with `chatId` in payload
+3. Lambda queries permissions table: `userId` + `chatId`
+4. If permission exists → message published
+5. If no permission → `403 Forbidden` response
 
----
-
-### Hub
-Target all users in a hub.
-
-```json
-{
-  "payload": {
-    "targetId": "hub-789",
-    "targetClass": "hub",
-    "eventType": "update",
-    "content": "Hub notification"
-  }
-}
-```
-
-**Routing**: Delivered to all active connections in hub-789
-
----
-
-### Project
-Target all users in a project.
-
-```json
-{
-  "payload": {
-    "targetId": "project-321",
-    "targetClass": "project",
-    "eventType": "status-change",
-    "content": "Project updated"
-  }
-}
-```
-
-**Routing**: Delivered to all active connections in project-321
+**Managing Permissions**: Use the `/permissions` API endpoint to grant/revoke chat access
 
 ---
 
@@ -691,10 +646,14 @@ Target all users in a project.
 ### Required Fields
 ✅ `targetChannel` - Must be a non-empty string  
 ✅ `payload` - Must be an object  
-✅ `payload.targetId` - Must be a non-empty string  
-✅ `payload.targetClass` - Must be "user", "org", "hub", or "project"  
+✅ `payload.chatId` - Must be a non-empty string (required for routing and permissions)  
 ✅ `payload.eventType` - Must be a non-empty string  
 ✅ `payload.content` - Can be any type (string, object, array, etc.)
+
+### Permission Requirements
+✅ User must be authenticated (Cognito JWT token)  
+✅ User must have permission to access the specified `chatId`  
+✅ Permission is verified before message publication
 
 ### Optional Field Rules
 
@@ -704,19 +663,20 @@ Target all users in a project.
 
 **messageGroupId** (FIFO only):
 - Ignored for standard messages
-- Default: Authenticated user ID
+- Default: Uses `chatId` from payload
 - Can be any string (e.g., "chat-room-123")
 
-**requestSequence** (in payload):
-- Automatically set to `true` for FIFO messages
-- Triggers DynamoDB sequence generation in Processor Lambda
+**generateSequence** (FIFO only):
+- Set to `true` to trigger DynamoDB sequence generation in Processor Lambda
+- Generates consecutive sequences (1,2,3...) for gap detection
+- Optional - only needed if you want custom sequences
 - Ignored for standard messages
 
 **customSequence** (FIFO only, in payload):
 - Must be an object with `number` and `scope`
 - `number` must be a positive integer
 - `scope` must be a non-empty string
-- If provided, overrides automatic sequence generation
+- If provided, overrides `generateSequence` automatic sequence generation
 - Use only if client manages sequence state
 
 **multiPartMetadata** (in payload):
@@ -733,6 +693,12 @@ Target all users in a project.
 ```json
 {
   "error": "Missing required parameters: targetChannel and payload are required."
+}
+```
+
+```json
+{
+  "error": "Missing required parameter: payload.chatId is required."
 }
 ```
 
@@ -756,6 +722,18 @@ Target all users in a project.
   "error": "Unauthorized - No user ID in context"
 }
 ```
+
+---
+
+### 403 Forbidden
+```json
+{
+  "error": "Forbidden: You do not have permission to send messages to this chat."
+}
+```
+
+**Cause**: User does not have permission to access the specified `chatId`  
+**Solution**: Request permission via the `/permissions` API or verify the correct `chatId`
 
 ---
 
@@ -912,8 +890,7 @@ Messages arrive at WebSocket clients with enriched metadata.
 ```json
 {
   // Original payload fields
-  "targetId": "user-123",
-  "targetClass": "user",
+  "chatId": "chat-123",
   "eventType": "chat",
   "content": "Hello!",
   
@@ -923,7 +900,7 @@ Messages arrive at WebSocket clients with enriched metadata.
   // Optional: Custom sequence (if generated or provided)
   "customSequence": {
     "number": 42,
-    "scope": "user:user-123",
+    "scope": "chat-123",
     "timestamp": "2025-10-12T14:30:00.000Z"
   },
   
@@ -937,7 +914,7 @@ Messages arrive at WebSocket clients with enriched metadata.
   // Added by Processor Lambda
   "sqsMetadata": {
     "sequenceNumber": "18779423847239847",  // FIFO only: for ordering
-    "messageGroupId": "user-123",            // FIFO only: ordering scope
+    "messageGroupId": "chat-123",            // FIFO only: ordering scope
     "messageId": "abc-123-def-456",          // SQS message ID
     "retryCount": 0                          // Delivery attempt count
   }
@@ -957,26 +934,25 @@ Do you need ordering at the client?
 │        ✅ No gap detection
 │
 └─ YES → Use messageType: "fifo"
-         ✅ Automatic consecutive sequences (1,2,3...)
-         ✅ Gap detection enabled
-         ✅ DynamoDB atomic counter
-         ⏱️  ~100-170ms (+15ms for sequences)
-         📋 Client sorts by customSequence.number
+         ✅ Ordered processing (sequential per messageGroupId)
+         ⏱️  ~80-150ms base latency
+         📋 Client can sort by sqsMetadata.sequenceNumber
          │
-         Is ordering critical (chat, transactions)?
+         Need gap detection (chat, transactions)?
          │
          ├─ NO (notifications, alerts)
-         │  └─ Simple approach: just display messages
+         │  └─ Simple FIFO: just ordered processing
          │     ✅ Works 95%+ of the time
-         │     ✅ Sequences available if needed later
+         │     ✅ Sort by SQS sequence if needed
          │     💡 Order usually preserved (same TCP connection)
          │
          └─ YES (chat, logs, critical sequences)
-            └─ Defensive approach: sort by sequence
-               ✅ Sort by customSequence.number
+            └─ FIFO with generateSequence: true
+               ✅ Consecutive sequences (1,2,3...)
                ✅ Guarantees correct display order
                ✅ Gap detection (can detect missing messages)
-               📋 Sequences automatically generated
+               ⏱️  ~100-170ms (+15ms for DynamoDB sequences)
+               📋 Sort by customSequence.number
 
 Multi-part message?
 └─ Add multiPartMetadata to payload
@@ -988,16 +964,16 @@ Multi-part message?
 
 ## Summary Table
 
-| Feature | Standard | FIFO (Auto-Sequences) | FIFO + Multi-Part |
-|---------|----------|----------------------|-------------------|
-| **Processing Order** | ❌ | ✅ | ✅ |
-| **Delivery Order** | ❌ | ⚠️ Usually* | ⚠️ Usually* |
-| **Client Reordering** | SQS seq | Custom seq** | Custom seq |
-| **Latency** | ~50-100ms | ~100-170ms | ~100-170ms |
-| **Gap Detection** | ❌ | ✅ | ✅ |
-| **Completeness** | ❌ | ✅ | ✅ (per part group) |
-| **Use Case** | Alerts | Chat/logs/notifications | File uploads |
-| **Overhead** | None | +DynamoDB | +DynamoDB |
+| Feature | Standard | FIFO | FIFO + generateSequence | FIFO + Multi-Part |
+|---------|----------|------|------------------------|-------------------|
+| **Processing Order** | ❌ | ✅ | ✅ | ✅ |
+| **Delivery Order** | ❌ | ⚠️ Usually* | ⚠️ Usually* | ⚠️ Usually* |
+| **Client Reordering** | SQS seq | SQS seq | Custom seq** | Custom seq |
+| **Latency** | ~50-100ms | ~80-150ms | ~100-170ms | ~100-170ms |
+| **Gap Detection** | ❌ | ❌ | ✅ | ✅ |
+| **Completeness** | ❌ | ❌ | ✅ | ✅ (per part group) |
+| **Use Case** | Alerts | Simple ordering | Chat/logs | File uploads |
+| **Overhead** | None | None | +DynamoDB | +DynamoDB |
 
 \* Usually in order (95%+) due to same TCP connection. Sort by sequence for critical apps.
 
