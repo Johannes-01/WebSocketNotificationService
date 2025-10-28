@@ -6,7 +6,6 @@ const dynamoDB = DynamoDBDocumentClient.from(client);
 
 exports.handler = async (event) => {
   try {
-    console.log('Received event:', JSON.stringify(event, null, 2));
     const connectionId = event.requestContext.connectionId;
     const { cognitoUserId, chatIds } = event.requestContext.authorizer || {};
 
@@ -30,8 +29,6 @@ exports.handler = async (event) => {
             body: 'At least one chatId must be provided',
           };
         }
-
-        console.log(`Connection ${connectionId} subscribing to chats:`, chatIdArray);
 
         // Create one connection record per chatId for efficient GSI queries
         // This denormalized approach allows fast lookups via ChatIdIndex
@@ -65,9 +62,7 @@ exports.handler = async (event) => {
         // Delete all connection records for this connectionId
         // Since we use composite keys (connectionId#chatId), we need to find all records
         // that belong to this connection and delete them
-        
-        console.log(`Connection ${connectionId} disconnecting - cleaning up all chat subscriptions`);
-        
+                
         try {
           // Scan for all records with this actualConnectionId
           // Note: In high-volume scenarios, consider adding a GSI on actualConnectionId
@@ -80,7 +75,6 @@ exports.handler = async (event) => {
           };
           
           const scanResult = await dynamoDB.send(new ScanCommand(scanParams));
-          console.log(`Found ${scanResult.Items?.length || 0} connection records to delete`);
           
           if (scanResult.Items && scanResult.Items.length > 0) {
             // Batch delete all found records
@@ -102,8 +96,6 @@ exports.handler = async (event) => {
                 }
               }));
             }
-            
-            console.log(`Successfully deleted ${scanResult.Items.length} connection records for ${connectionId}`);
           }
         } catch (scanError) {
           console.error('Error during disconnect cleanup:', scanError);
@@ -116,7 +108,8 @@ exports.handler = async (event) => {
     
     return { statusCode: 404, body: 'Route not found'}; 
   } catch (error) {
-    console.error('Error in connection handler:', error);
+    console.error('Error in connection handler:', error.name, error.message);
+
     return {
       statusCode: 500,
       body: `Internal server error: ${error.message}`,

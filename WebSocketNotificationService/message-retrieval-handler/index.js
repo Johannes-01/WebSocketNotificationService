@@ -31,6 +31,7 @@ async function hasPermission(userId, chatId) {
   }
 }
 
+// TODO: filterung nach sequence number hinzufügen
 exports.handler = async (event) => {
   console.log('Received message retrieval request:', JSON.stringify(event, null, 2));
 
@@ -124,7 +125,7 @@ exports.handler = async (event) => {
 
       if (filterExpression.length > 0) {
         queryParams.FilterExpression = filterExpression.join(' AND ');
-        queryParams.ExpressionAttributeNames = { '#ts': 'timestamp' };
+        queryParams.ExpressionAttributeNames = { '#ts': 'publishedAt' };
       }
     }
 

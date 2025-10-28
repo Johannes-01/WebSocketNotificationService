@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 import { useAuth } from '@/contexts/AuthContext';
 import { metricsService } from '@/services/metrics';
@@ -15,7 +15,6 @@ export interface Message {
   content: string;
   payload?: any;
   latency?: number; // E2E latency in milliseconds
-  networkLatency?: number; // Processor → client latency
   sequenceNumber?: number; // Custom consecutive sequence number
   isOutOfOrder?: boolean; // True if sequence number is not consecutive
   missingCount?: number; // Number of messages potentially lost
@@ -106,27 +105,25 @@ export default function MultiClientTester() {
           
           // Track end-to-end latency if timestamps are available
           let e2eLatency: number | undefined;
-          let networkLatency: number | undefined;
-          
-          if (data.publishTimestamp && data.processorTimestamp) {
+
+          if (data.publishTimestamp) {
             const publishTime = new Date(data.publishTimestamp);
-            const processorTime = new Date(data.processorTimestamp);
             
             e2eLatency = clientReceiveTime.getTime() - publishTime.getTime();
-            networkLatency = clientReceiveTime.getTime() - processorTime.getTime();
             
             // Send metrics to the collector Lambda
             const token = await getIdToken();
             if (token) {
               await metricsService.trackEndToEndLatency(
-                data.publishTimestamp,
-                data.processorTimestamp,
+                publishTime,
                 clientReceiveTime,
-                token
+                token,
+                data.messageId,
+                data.chatId || data.payload?.chatId
               );
             }
             
-            addLog(`📊 Latency - E2E: ${e2eLatency}ms, Network: ${networkLatency}ms`, clientId);
+            addLog(`📊 Latency - E2E: ${e2eLatency}ms`, clientId);
           }
           
           // Track sequence numbers if present
@@ -154,12 +151,6 @@ export default function MultiClientTester() {
                 
                 if (missingCount > 0) {
                   addLog(`⚠️ Sequence gap! Expected: ${expectedSeq}, Got: ${currentSeq}, Missing: ${missingCount}`, clientId);
-                  
-                  // Track message loss metric
-                  const token = await getIdToken();
-                  if (token) {
-                    await metricsService.trackMessageLoss(expectedSeq, currentSeq, token);
-                  }
                 } else {
                   addLog(`⚠️ Out-of-order sequence! Expected: ${expectedSeq}, Got: ${currentSeq}`, clientId);
                 }
@@ -192,7 +183,6 @@ export default function MultiClientTester() {
             content: data.content || data.payload?.content || JSON.stringify(data),
             payload: data,
             latency: e2eLatency,
-            networkLatency: networkLatency,
             sequenceNumber,
             isOutOfOrder,
             missingCount,

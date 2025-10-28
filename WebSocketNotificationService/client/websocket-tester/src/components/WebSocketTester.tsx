@@ -4,6 +4,7 @@ import { useState, useEffect, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import { useAuth } from '@/contexts/AuthContext';
 import { metricsService } from '@/services/metrics';
+import { AckManager } from '@/utils/AckManager';
 
 interface Message {
   id: string;
@@ -13,7 +14,6 @@ interface Message {
   content: string;
   payload?: any;
   latency?: number; // E2E latency in milliseconds
-  networkLatency?: number; // Processor → client latency
   sequenceNumber?: number; // Sequence number (custom consecutive or SQS for display)
   isCustomSequence?: boolean; // True if using custom consecutive sequences (gap detection), false if SQS (ordering only)
   isOutOfOrder?: boolean; // True if sequence number is not consecutive
@@ -28,6 +28,9 @@ export default function WebSocketTester() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [connectionLog, setConnectionLog] = useState<string[]>([]);
   
+  // ACK Manager for P2P sequential burst sends
+  const ackManagerRef = useRef<AckManager | null>(null);
+  
   // Sequence tracking per scope (targetClass:targetId)
   const [lastSequenceByScope, setLastSequenceByScope] = useState<Record<string, number>>({});
   
@@ -40,7 +43,14 @@ export default function WebSocketTester() {
   const [messageContent, setMessageContent] = useState('');
   const [messageType, setMessageType] = useState<'standard' | 'fifo'>('standard');
   const [messageGroupId, setMessageGroupId] = useState('');
-  const [generateSequence, setGenerateSequence] = useState(false); // Enable custom sequence numbers
+  
+  // Bulk sending state
+  const [bulkCount, setBulkCount] = useState(1000);
+  const [bulkSending, setBulkSending] = useState(false);
+  const [bulkProgress, setBulkProgress] = useState(0);
+  const [bulkStats, setBulkStats] = useState<{sent: number, failed: number, duration: number} | null>(null);
+  const [bulkSequential, setBulkSequential] = useState(false); // Sequential sending (await each response)
+  const [bulkMethod, setBulkMethod] = useState<'p2p' | 'a2p'>('p2p'); // Publishing method for bulk send
   
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
@@ -82,29 +92,32 @@ export default function WebSocketTester() {
         try {
           const data = JSON.parse(event.data);
           
-          // Track end-to-end latency if timestamps are available
-          let e2eLatency: number | undefined;
-          let networkLatency: number | undefined;
+          // Skip ACK messages - they're handled by AckManager, not displayed in chat
+          if (data.type === 'ack') {
+            addLog(`✅ ACK received: ${data.ackId} (${data.messageId})`);
+            return; // Don't add ACK messages to the message list
+          }
           
-          if (data.publishTimestamp && data.processorTimestamp) {
+          let e2eLatency: number | undefined;
+
+          if (data.publishTimestamp) {
             const publishTime = new Date(data.publishTimestamp);
-            const processorTime = new Date(data.processorTimestamp);
             
             e2eLatency = clientReceiveTime.getTime() - publishTime.getTime();
-            networkLatency = clientReceiveTime.getTime() - processorTime.getTime();
             
             // Send metrics to the collector Lambda
             const token = await getIdToken();
             if (token) {
               await metricsService.trackEndToEndLatency(
-                data.publishTimestamp,
-                data.processorTimestamp,
+                publishTime,
                 clientReceiveTime,
-                token
+                token,
+                data.messageId, // Pass messageId for correlation
+                data.chatId || data.payload?.chatId // Pass chatId for correlation
               );
             }
             
-            addLog(`📊 Latency - E2E: ${e2eLatency}ms, Network: ${networkLatency}ms`);
+            addLog(`📊 Latency - E2E: ${e2eLatency}ms`);
           }
           
           // Track sequence numbers if present
@@ -133,12 +146,6 @@ export default function WebSocketTester() {
                 
                 if (missingCount > 0) {
                   addLog(`⚠️ Sequence gap detected! Expected: ${expectedSeq}, Got: ${currentSeq}, Missing: ${missingCount}`);
-                  
-                  // Track message loss metric
-                  const token = await getIdToken();
-                  if (token) {
-                    await metricsService.trackMessageLoss(expectedSeq, currentSeq, token);
-                  }
                 } else {
                   addLog(`⚠️ Out-of-order sequence! Expected: ${expectedSeq}, Got: ${currentSeq}`);
                 }
@@ -193,7 +200,6 @@ export default function WebSocketTester() {
             content: data.content || data.payload?.content || JSON.stringify(data),
             payload: data,
             latency: e2eLatency,
-            networkLatency: networkLatency,
             sequenceNumber,
             isCustomSequence,
             isOutOfOrder,
@@ -220,9 +226,18 @@ export default function WebSocketTester() {
       websocket.onclose = (event) => {
         addLog(`🔌 WebSocket closed. Code: ${event.code}, Reason: ${event.reason || 'No reason provided'}`);
         setConnected(false);
+        // Clean up ACK manager
+        if (ackManagerRef.current) {
+          ackManagerRef.current.destroy();
+          ackManagerRef.current = null;
+        }
       };
 
       setWs(websocket);
+      
+      // Initialize ACK manager for this connection
+      ackManagerRef.current = new AckManager(websocket, 10000); // 10 second timeout for bulk operations
+      addLog('✅ ACK Manager initialized (10s timeout)');
     } catch (error) {
       addLog(`❌ Connection failed: ${error}`);
       console.error('Connection error:', error);
@@ -235,6 +250,11 @@ export default function WebSocketTester() {
       setWs(null);
       setConnected(false);
       addLog('🔌 Disconnected manually');
+      // Clean up ACK manager
+      if (ackManagerRef.current) {
+        ackManagerRef.current.destroy();
+        ackManagerRef.current = null;
+      }
     }
   };
 
@@ -254,17 +274,17 @@ export default function WebSocketTester() {
       targetChannel: 'WebSocket',
       messageType,
       ...(messageType === 'fifo' && messageGroupId && { messageGroupId }),
-      ...(messageType === 'fifo' && generateSequence && { generateSequence: true }),
+      ...(messageType === 'fifo' && { generateSequence: true }), // Request sequence generation at top level
       payload: {
         chatId,
         eventType,
         content: messageContent,
-        timestamp: new Date().toISOString()
+        // No timestamp - publisher Lambda adds publishTimestamp automatically
       }
     };
 
     ws.send(JSON.stringify(message));
-    addLog(`📤 Sent P2P message to chat ${chatId}${messageType === 'fifo' && messageGroupId ? ` (group: ${messageGroupId})` : ''}${messageType === 'fifo' && generateSequence ? ' [seq]' : ''}`);
+    addLog(`📤 Sent P2P message to chat ${chatId}${messageType === 'fifo' && messageGroupId ? ` (group: ${messageGroupId})` : ''}${messageType === 'fifo' ? ' [seq]' : ''}`);
 
     const msg: Message = {
       id: Math.random().toString(36),
@@ -302,16 +322,15 @@ export default function WebSocketTester() {
         targetChannel: 'WebSocket',
         messageType,
         ...(messageType === 'fifo' && messageGroupId && { messageGroupId }),
-        ...(messageType === 'fifo' && generateSequence && { generateSequence: true }),
+        ...(messageType === 'fifo' && { generateSequence: true }), // Request sequence generation at top level
         payload: {
           chatId,
           eventType,
           content: messageContent,
-          timestamp: new Date().toISOString()
         }
       };
 
-      addLog(`📤 Sending A2P message via HTTP to ${endpoint}...${messageType === 'fifo' && messageGroupId ? ` (group: ${messageGroupId})` : ''}${messageType === 'fifo' && generateSequence ? ' [seq]' : ''}`);
+      addLog(`📤 Sending A2P message via HTTP to ${endpoint}...${messageType === 'fifo' && messageGroupId ? ` (group: ${messageGroupId})` : ''}${messageType === 'fifo' ? ' [seq]' : ''}`);
       console.log('A2P Request:', { endpoint, message, token: `${token.substring(0, 20)}...` });
       
       const response = await fetch(endpoint, {
@@ -349,6 +368,324 @@ export default function WebSocketTester() {
       const errorMessage = error instanceof Error ? error.message : String(error);
       addLog(`❌ A2P request failed: ${errorMessage}`);
       console.error('A2P error:', error);
+    }
+  };
+
+  /**
+   * Send bulk messages with flexible options
+   * Supports:
+   * - Method: P2P (WebSocket) or A2P (HTTP)
+   * - Mode: Parallel (fast) or Sequential (ordered)
+   * - Type: FIFO (with sequences) or Standard (fast)
+   */
+  const sendBulkMessages = async () => {
+    // Validate prerequisites based on selected method
+    if (bulkMethod === 'p2p' && (!ws || !connected)) {
+      addLog('❌ Not connected to WebSocket. Connect first or switch to A2P method.');
+      return;
+    }
+
+    if (bulkSending) {
+      addLog('⚠️ Bulk send already in progress');
+      return;
+    }
+
+    setBulkSending(true);
+    setBulkProgress(0);
+    setBulkStats(null);
+
+    const startTime = Date.now();
+    let sentCount = 0;
+    let failedCount = 0;
+
+    const methodLabel = bulkMethod === 'p2p' ? 'P2P WebSocket' : 'A2P HTTP';
+    const modeLabel = bulkSequential ? 'Sequential' : 'Parallel';
+    const mode = `${modeLabel} (${methodLabel})`;
+    
+    addLog(`🚀 Starting bulk send: ${bulkCount} messages via ${mode}`);
+    addLog(`   Target: chat-${chatId}, Type: ${messageType}${messageType === 'fifo' ? ' [with sequences]' : ''}`);
+
+    try {
+      if (bulkMethod === 'a2p') {
+        // A2P HTTP Publishing (Sequential or Parallel)
+        const token = await getIdToken();
+        if (!token) {
+          addLog('❌ Failed to get authentication token');
+          setBulkSending(false);
+          return;
+        }
+
+        const endpoint = process.env.NEXT_PUBLIC_HTTP_PUBLISH_ENDPOINT;
+        if (!endpoint) {
+          addLog('❌ HTTP publish endpoint not configured');
+          setBulkSending(false);
+          return;
+        }
+
+        addLog(`   📡 A2P HTTP mode${bulkSequential ? ' (sequential - awaiting responses)' : ' (parallel - fire and forget)'}`);
+        addLog(`   📋 Endpoint: ${endpoint}`);
+        addLog(`   👤 User: ${user?.getUsername()}`);
+        addLog(`   💬 Target chat: ${chatId}`);
+        // Base message template for A2P
+        const baseMessage = {
+          targetChannel: 'WebSocket',
+          messageType,
+          ...(messageType === 'fifo' && messageGroupId && { messageGroupId }),
+          ...(messageType === 'fifo' && { generateSequence: true }), // Request sequence generation at top level
+          payload: {
+            chatId,
+            eventType: 'bulk-test',
+            content: '',
+            bulkIndex: 0,
+          }
+        };
+
+        if (bulkSequential) {
+          // A2P Sequential: Wait for each HTTP response
+          for (let i = 0; i < bulkCount; i++) {
+            const messageNum = i + 1;
+            
+            baseMessage.payload.content = `A2P Sequential ${messageNum}/${bulkCount}`;
+            baseMessage.payload.bulkIndex = messageNum;
+
+            try {
+              const response = await fetch(endpoint, {
+                method: 'POST',
+                headers: {
+                  'Authorization': `Bearer ${token}`,
+                  'Content-Type': 'application/json',
+                },
+                body: JSON.stringify(baseMessage)
+              });
+
+              if (response.ok) {
+                sentCount++;
+              } else {
+                failedCount++;
+                console.error(JSON.stringify(response))
+                const errorText = await response.text().catch(() => 'Unable to read error response');
+                console.error(`Failed to send message ${messageNum}: ${response.status} ${response.statusText}`, errorText);
+                
+                if (failedCount === 1) {
+                  addLog(`⚠️ First HTTP error: ${response.status} ${response.statusText}`);
+                  addLog(`   Details: ${errorText.substring(0, 100)}`);
+                }
+              }
+
+              // Update progress every 10 messages
+              if (messageNum % 10 === 0) {
+                const progress = Math.floor((messageNum / bulkCount) * 100);
+                setBulkProgress(progress);
+                addLog(`   Progress: ${messageNum}/${bulkCount} (${progress}%) - Failed: ${failedCount}`);
+              }
+            } catch (error) {
+              failedCount++;
+              console.error(`Failed to send message ${messageNum}:`, error);
+            }
+          }
+        } else {
+          // A2P Parallel: Fire all requests concurrently
+          const promises = [];
+          for (let i = 0; i < bulkCount; i++) {
+            const messageNum = i + 1;
+            const message = {
+              ...baseMessage,
+              payload: {
+                ...baseMessage.payload,
+                content: `A2P Parallel ${messageNum}/${bulkCount}`,
+                bulkIndex: messageNum,
+              }
+            };
+
+            const promise = fetch(endpoint, {
+              method: 'POST',
+              headers: {
+                'Authorization': `Bearer ${token}`,
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify(message)
+            })
+            .then(response => {
+              if (response.ok) {
+                sentCount++;
+              } else {
+                failedCount++;
+              }
+              return response.ok;
+            })
+            .catch(error => {
+              failedCount++;
+              console.error(`Failed to send message ${messageNum}:`, error);
+              return false;
+            });
+
+            promises.push(promise);
+
+            // Update progress every 100 requests
+            if (messageNum % 100 === 0) {
+              const progress = Math.floor((messageNum / bulkCount) * 100);
+              setBulkProgress(progress);
+              addLog(`   Queued: ${messageNum}/${bulkCount} (${progress}%)`);
+            }
+          }
+
+          // Wait for all parallel requests to complete
+          addLog(`   ⏳ Waiting for ${bulkCount} parallel HTTP requests...`);
+          await Promise.all(promises);
+        }
+      } else {
+        // P2P WebSocket Publishing (Sequential or Parallel)
+        if (!ws) {
+          addLog('❌ WebSocket connection lost');
+          setBulkSending(false);
+          return;
+        }
+
+        addLog(`   ⚡ P2P WebSocket mode${bulkSequential ? ' (sequential - awaiting ACKs)' : ' (parallel - fire and forget)'}`);
+        
+        // Base message template for P2P
+        const baseMessage = {
+          action: 'sendMessage',
+          targetChannel: 'WebSocket',
+          messageType,
+          ...(messageType === 'fifo' && messageGroupId && { messageGroupId }),
+          ...(messageType === 'fifo' && { generateSequence: true }), // Request sequence generation at top level
+          payload: {
+            chatId,
+            eventType: 'bulk-test',
+            content: '',
+            bulkIndex: 0,
+          }
+        };
+
+        if (bulkSequential) {
+          // P2P Sequential: Wait for ACK from server before sending next message
+          if (!ackManagerRef.current) {
+            addLog('❌ ACK Manager not initialized. Reconnect to WebSocket.');
+            setBulkSending(false);
+            return;
+          }
+
+          addLog(`   ✅ Sequential WebSocket mode with ACK confirmation (10s timeout per message)`);
+          addLog(`   📊 Tracking: sent, ACK received, failed, timeouts`);
+          
+          let ackReceivedCount = 0;
+          let timeoutCount = 0;
+          
+          for (let i = 0; i < bulkCount; i++) {
+            const messageNum = i + 1;
+            
+            baseMessage.payload.content = `P2P Sequential ACK ${messageNum}/${bulkCount}`;
+            baseMessage.payload.bulkIndex = messageNum;
+
+            try {
+              // Send message and wait for ACK
+              const ack = await ackManagerRef.current.sendWithAck(baseMessage);
+              
+              sentCount++;
+              ackReceivedCount++;
+              
+              // Log successful ACK every 100 messages
+              if (messageNum % 100 === 0) {
+                addLog(`   ✅ ACK ${messageNum}: ${ack.messageId} (seq: ${ack.sequenceNumber || 'N/A'})`);
+              }
+            } catch (error) {
+              failedCount++;
+              
+              // Check if it's a timeout or send error
+              const errorMessage = error instanceof Error ? error.message : String(error);
+              if (errorMessage.includes('timeout')) {
+                timeoutCount++;
+                console.warn(`ACK timeout for message ${messageNum} (message may still be delivered)`);
+              } else {
+                console.error(`Failed to send message ${messageNum}:`, error);
+              }
+              
+              // Log first few errors for debugging
+              if (failedCount <= 3) {
+                addLog(`   ❌ Message ${messageNum} failed: ${errorMessage.substring(0, 60)}`);
+              }
+            }
+
+            // Update progress every 50 messages
+            if (messageNum % 50 === 0) {
+              const progress = Math.floor((messageNum / bulkCount) * 100);
+              setBulkProgress(progress);
+              addLog(`   Progress: ${messageNum}/${bulkCount} (${progress}%) | ACKs: ${ackReceivedCount} | Timeouts: ${timeoutCount}`);
+            }
+          }
+          
+          // Final ACK statistics
+          addLog(`   📊 ACK Summary: ${ackReceivedCount} confirmed, ${timeoutCount} timeouts, ${failedCount - timeoutCount} failed`);
+        } else {
+          // P2P Parallel: Send all messages as fast as possible
+          let progressUpdateCounter = 0;
+          
+          for (let i = 0; i < bulkCount; i++) {
+            const messageNum = i + 1;
+            
+            baseMessage.payload.content = `P2P Parallel ${messageNum}/${bulkCount}`;
+            baseMessage.payload.bulkIndex = messageNum;
+
+            try {
+              ws.send(JSON.stringify(baseMessage));
+              sentCount++;
+              
+              // Update progress every 100 messages
+              if (messageNum % 100 === 0) {
+                progressUpdateCounter++;
+                const progress = Math.floor((messageNum / bulkCount) * 100);
+                setBulkProgress(progress);
+                
+                // Only log every 200 messages to reduce overhead
+                if (progressUpdateCounter % 2 === 0) {
+                  addLog(`   Progress: ${messageNum}/${bulkCount} (${progress}%)`);
+                }
+              }
+            } catch (error) {
+              failedCount++;
+              console.error(`Failed to send message ${messageNum}:`, error);
+            }
+          }
+        }
+      }
+
+      const endTime = Date.now();
+      const duration = endTime - startTime;
+      const messagesPerSecond = Math.floor((sentCount / duration) * 1000);
+
+      setBulkProgress(100);
+      setBulkStats({
+        sent: sentCount,
+        failed: failedCount,
+        duration,
+      });
+
+      const successRate = ((sentCount / bulkCount) * 100).toFixed(1);
+      
+      addLog(`✅ Bulk send complete!`);
+      addLog(`   Sent: ${sentCount}/${bulkCount} messages (${successRate}% success rate)`);
+      addLog(`   Failed: ${failedCount} messages`);
+      addLog(`   Duration: ${duration}ms (${(duration / 1000).toFixed(2)}s)`);
+      addLog(`   Speed: ${messagesPerSecond} messages/second`);
+      
+      if (failedCount > 0) {
+        addLog(`   ⚠️ Note: ${failedCount} messages failed (may be ${bulkMethod === 'a2p' ? 'HTTP errors or ' : ''}Lambda throttling)`);
+      }
+      
+      if (duration < 1000 && !bulkSequential && bulkMethod === 'p2p') {
+        addLog(`   🎯 Target achieved: ${sentCount} messages in < 1 second!`);
+      }
+      
+      if (bulkSequential && sentCount === bulkCount) {
+        addLog(`   ✅ Sequential mode: All messages sent in order`);
+      }
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      addLog(`❌ Bulk send failed: ${errorMessage}`);
+      console.error('Bulk send error:', error);
+    } finally {
+      setBulkSending(false);
     }
   };
 
@@ -514,30 +851,184 @@ export default function WebSocketTester() {
                     </p>
                   </div>
                   
-                  <div className="flex items-center space-x-2 p-3 bg-blue-50 border border-blue-200 rounded-md">
-                    <input
-                      type="checkbox"
-                      id="generateSequence"
-                      checked={generateSequence}
-                      onChange={(e) => setGenerateSequence(e.target.checked)}
-                      className="w-4 h-4 text-blue-600 rounded focus:ring-blue-500"
-                    />
-                    <label htmlFor="generateSequence" className="text-sm font-medium text-gray-700 cursor-pointer flex-1">
-                      Generate Sequence Numbers
-                    </label>
+                  <div className="p-3 bg-blue-50 border border-blue-200 rounded-md">
+                    <p className="text-xs text-blue-800">
+                      <strong>🔢 Sequence Numbers:</strong> FIFO messages automatically include consecutive sequence numbers for gap detection and message loss tracking.
+                    </p>
+                    <p className="text-xs text-blue-700 mt-1">
+                      <strong>⚠️ Note:</strong> Sequence generation adds ~50-100ms latency due to DynamoDB atomic counter.
+                    </p>
                   </div>
-                  {generateSequence && (
-                    <div className="p-3 bg-yellow-50 border border-yellow-200 rounded-md">
-                      <p className="text-xs text-yellow-800">
-                        <strong>⚠️ Performance Note:</strong> Custom sequence generation adds ~50-100ms latency per message due to DynamoDB atomic counter.
-                      </p>
-                      <p className="text-xs text-yellow-700 mt-1">
-                        <strong>✅ Benefits:</strong> Gap detection, message loss tracking, completeness validation.
-                      </p>
-                    </div>
-                  )}
                 </>
               )}
+            </div>
+          </div>
+
+          {/* Bulk Send Section */}
+          <div className="border-t pt-4">
+            <h2 className="text-lg font-semibold mb-3 text-gray-900">⚡ Bulk Send</h2>
+            <div className="space-y-3">
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  Number of Messages
+                </label>
+                <input
+                  type="number"
+                  value={bulkCount}
+                  onChange={(e) => setBulkCount(parseInt(e.target.value) || 1000)}
+                  min="1"
+                  max="10000"
+                  className="w-full px-3 py-2 border rounded-md text-sm"
+                  placeholder="1000"
+                  disabled={bulkSending}
+                />
+                <p className="text-xs text-gray-500 mt-1">
+                  Send multiple messages rapidly
+                </p>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  Publishing Method
+                </label>
+                <select
+                  value={bulkMethod}
+                  onChange={(e) => setBulkMethod(e.target.value as 'p2p' | 'a2p')}
+                  className="w-full px-3 py-2 border rounded-md text-sm"
+                  disabled={bulkSending}
+                >
+                  <option value="p2p">P2P - WebSocket</option>
+                  <option value="a2p">A2P - HTTP REST</option>
+                </select>
+                <p className="text-xs text-gray-500 mt-1">
+                  {bulkMethod === 'p2p' ? 'Requires WebSocket connection' : 'Works without WebSocket'}
+                </p>
+              </div>
+              
+              <div className="flex items-center space-x-2 p-3 bg-purple-50 border border-purple-200 rounded-md">
+                <input
+                  type="checkbox"
+                  id="bulkSequential"
+                  checked={bulkSequential}
+                  onChange={(e) => setBulkSequential(e.target.checked)}
+                  className="w-4 h-4 text-purple-600 rounded focus:ring-purple-500"
+                  disabled={bulkSending}
+                />
+                <label htmlFor="bulkSequential" className="text-sm font-medium text-gray-700 cursor-pointer flex-1">
+                  Sequential Mode
+                </label>
+              </div>
+              
+              {bulkMethod === 'p2p' ? (
+                bulkSequential ? (
+                  <div className="p-3 bg-blue-50 border border-blue-200 rounded-md">
+                    <p className="text-xs text-blue-800">
+                      <strong>⚡ P2P Sequential with ACK:</strong> Waits for server acknowledgment before sending next message.
+                    </p>
+                    <p className="text-xs text-blue-700 mt-1">
+                      <strong>✅ Benefits:</strong> Guaranteed delivery confirmation, tracks timeouts, no message loss.
+                    </p>
+                    <p className="text-xs text-blue-700 mt-1">
+                      <strong>⏱️ Timeout:</strong> 10s per message | <strong>📊 Tracking:</strong> sent, ACKs, timeouts
+                    </p>
+                  </div>
+                ) : (
+                  <div className="p-3 bg-orange-50 border border-orange-200 rounded-md">
+                    <p className="text-xs text-orange-800">
+                      <strong>⚡ P2P Parallel:</strong> Sends all messages via WebSocket instantly.
+                    </p>
+                    <p className="text-xs text-orange-700 mt-1">
+                      <strong>✅ Benefits:</strong> Maximum throughput (~1000 msg/sec).
+                    </p>
+                    <p className="text-xs text-orange-700 mt-1">
+                      <strong>⚠️ Note:</strong> Concurrent Lambda invocations.
+                    </p>
+                  </div>
+                )
+              ) : (
+                bulkSequential ? (
+                  <div className="p-3 bg-blue-50 border border-blue-200 rounded-md">
+                    <p className="text-xs text-blue-800">
+                      <strong>📡 A2P Sequential:</strong> HTTP requests with response awaiting.
+                    </p>
+                    <p className="text-xs text-blue-700 mt-1">
+                      <strong>✅ Benefits:</strong> Guaranteed SNS arrival order, confirmations.
+                    </p>
+                    <p className="text-xs text-blue-700 mt-1">
+                      <strong>⏱️ Speed:</strong> ~{Math.floor(bulkCount * 0.075)}s for {bulkCount} messages
+                    </p>
+                  </div>
+                ) : (
+                  <div className="p-3 bg-orange-50 border border-orange-200 rounded-md">
+                    <p className="text-xs text-orange-800">
+                      <strong>📡 A2P Parallel:</strong> Concurrent HTTP requests.
+                    </p>
+                    <p className="text-xs text-orange-700 mt-1">
+                      <strong>✅ Benefits:</strong> Fast HTTP publishing (~100-200 msg/sec).
+                    </p>
+                    <p className="text-xs text-orange-700 mt-1">
+                      <strong>⚠️ Note:</strong> May hit rate limits with very high counts.
+                    </p>
+                  </div>
+                )
+              )}
+              
+              <button
+                onClick={sendBulkMessages}
+                disabled={(bulkMethod === 'p2p' && !connected) || bulkSending}
+                className="w-full bg-orange-600 text-white py-2 px-4 rounded-md hover:bg-orange-700 disabled:bg-gray-300 disabled:cursor-not-allowed transition-colors font-medium"
+              >
+                {bulkSending 
+                  ? `🔄 Sending... ${bulkProgress}%` 
+                  : `${bulkMethod === 'p2p' ? '⚡' : '📡'} Send ${bulkCount} (${bulkSequential ? 'Sequential' : 'Parallel'})`
+                }
+              </button>
+              
+              {bulkStats && (
+                <div className={`p-3 border rounded-md text-xs ${
+                  bulkStats.failed === 0 
+                    ? 'bg-green-50 border-green-200' 
+                    : bulkStats.failed < bulkCount * 0.1 
+                      ? 'bg-yellow-50 border-yellow-200'
+                      : 'bg-red-50 border-red-200'
+                }`}>
+                  <div className={`font-semibold mb-1 ${
+                    bulkStats.failed === 0 ? 'text-green-800' : 'text-yellow-800'
+                  }`}>
+                    {bulkStats.failed === 0 ? '✅' : '⚠️'} Bulk Send Complete
+                  </div>
+                  <div className={`space-y-0.5 ${
+                    bulkStats.failed === 0 ? 'text-green-700' : 'text-yellow-700'
+                  }`}>
+                    <div>Sent: {bulkStats.sent}/{bulkCount} messages ({((bulkStats.sent / bulkCount) * 100).toFixed(1)}% success)</div>
+                    {bulkStats.failed > 0 && (
+                      <div className="text-red-600">Failed: {bulkStats.failed} messages (HTTP errors)</div>
+                    )}
+                    <div>Duration: {bulkStats.duration}ms ({(bulkStats.duration / 1000).toFixed(2)}s)</div>
+                    <div>Speed: {Math.floor((bulkStats.sent / bulkStats.duration) * 1000)} msg/sec</div>
+                    {bulkStats.failed === 0 ? (
+                      <div className="text-green-600 font-semibold mt-1">
+                        ✅ Perfect! All messages sent successfully!
+                      </div>
+                    ) : bulkStats.failed < bulkCount * 0.1 ? (
+                      <div className="text-yellow-700 mt-1">
+                        💡 {bulkStats.failed} failures likely due to Lambda cold starts/throttling
+                      </div>
+                    ) : (
+                      <div className="text-red-700 mt-1">
+                        ⚠️ High failure rate - check permissions and Lambda logs
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+              
+              {bulkMethod === 'p2p' && !connected && (
+                <div className="p-2 bg-yellow-50 border border-yellow-200 rounded text-xs text-yellow-800">
+                  ⚠️ Connect to WebSocket to use P2P method, or switch to A2P
+                </div>
+              )}
+
             </div>
           </div>
         </div>
@@ -617,12 +1108,6 @@ export default function WebSocketTester() {
                         )}
                       </div>
                     )}
-                    
-                    {msg.networkLatency !== undefined && (
-                      <div className="mt-1 text-xs text-gray-600">
-                        Network: {msg.networkLatency}ms
-                      </div>
-                    )}
                     {msg.payload && (
                       <details className="mt-2">
                         <summary className="text-xs text-gray-600 cursor-pointer">View payload</summary>
@@ -654,13 +1139,13 @@ export default function WebSocketTester() {
                 disabled={!connected}
                 className="px-6 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 disabled:bg-gray-300 disabled:cursor-not-allowed transition-colors font-medium"
               >
-                📤 P2P{messageType === 'fifo' && generateSequence && ' 🔢'}
+                📤 P2P{messageType === 'fifo' && ' 🔢'}
               </button>
               <button
                 onClick={sendA2PMessage}
                 className="px-6 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors font-medium"
               >
-                📡 A2P{messageType === 'fifo' && generateSequence && ' 🔢'}
+                📡 A2P{messageType === 'fifo' && ' 🔢'}
               </button>
               <button
                 onClick={clearMessages}
@@ -672,12 +1157,12 @@ export default function WebSocketTester() {
             <div className="mt-2 text-xs text-gray-600">
               <span className="font-semibold">P2P:</span> Send via WebSocket (requires connection) |{' '}
               <span className="font-semibold">A2P:</span> Send via HTTP API (no connection needed)
-              {messageType === 'fifo' && generateSequence && (
+              {messageType === 'fifo' && (
                 <span className="ml-2 text-blue-600 font-semibold">
                   | 🔢 Custom Sequences <span className="text-green-600">●</span> (Gap detection enabled)
                 </span>
               )}
-              {messageType === 'fifo' && !generateSequence && (
+              {messageType === 'standard' && (
                 <span className="ml-2 text-orange-600 font-semibold">
                   | SQS Sequences <span className="text-orange-500">○</span> (Ordering only)
                 </span>

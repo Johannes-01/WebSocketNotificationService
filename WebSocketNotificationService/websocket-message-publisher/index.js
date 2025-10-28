@@ -29,7 +29,6 @@ async function getNextSequence(scope) {
 
 exports.handler = async (event) => {
     try {
-        console.log('Received WebSocket event:', JSON.stringify(event, null, 2));
 
         // Extract authenticated user ID from WebSocket authorizer context
         const cognitoUserId = event.requestContext?.authorizer?.cognitoUserId;
@@ -111,34 +110,13 @@ exports.handler = async (event) => {
         const messageToPublish = {
             ...payload,
             publishTimestamp: publishTimestamp,
+            // Pass through generateSequence flag to processor for FIFO ordering
+            ...(messageType === 'fifo' && generateSequence && { generateSequence: true }),
         };
-
-        // Handle custom sequence numbers (only for FIFO messages)
-        if (messageType === 'fifo') {
-            // Option 1: Client provides their own sequence (pass through)
-            if (payload.customSequence) {
-                messageToPublish.customSequence = payload.customSequence;
-                console.log(`Using client-provided sequence: ${payload.customSequence.number} for scope ${payload.customSequence.scope}`);
-            }
-            // Option 2: Client requests Lambda to generate sequence (opt-in)
-            else if (generateSequence) {
-                const scope = payload.chatId; // Use chatId as scope
-                try {
-                    const customSeq = await getNextSequence(scope);
-                    messageToPublish.sequenceNumber = customSeq;
-                    console.log(`Generated sequence ${customSeq} for chatId ${scope}`);
-                } catch (error) {
-                    console.error('Failed to generate sequence, continuing without it:', error);
-                    // Continue without sequence - non-critical
-                }
-            }
-            // Option 3: No sequence (fastest, default)
-        }
 
         // Pass through multiPartMetadata if provided (for multi-part message completeness checking)
         if (payload.multiPartMetadata) {
             messageToPublish.multiPartMetadata = payload.multiPartMetadata;
-            console.log(`Multi-part message: ${payload.multiPartMetadata.groupId} (part ${payload.multiPartMetadata.partNumber}/${payload.multiPartMetadata.totalParts})`);
         }
 
         // Select topic based on messageType
@@ -167,7 +145,6 @@ exports.handler = async (event) => {
             // Use user-provided messageGroupId or fallback to chatId for logical grouping
             const groupId = messageGroupId || payload.chatId;
             publishParams.MessageGroupId = groupId;
-            console.log(`Using MessageGroupId: ${groupId} (${messageGroupId ? 'user-provided' : 'auto-generated from chatId'})`);
             // MessageDeduplicationId is not needed due to ContentBasedDeduplication on the topic
         }
 

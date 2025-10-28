@@ -6,30 +6,8 @@ const sns = new SNSClient({});
 const dynamoClient = new DynamoDBClient({});
 const docClient = DynamoDBDocumentClient.from(dynamoClient);
 
-const SEQUENCE_TABLE = process.env.SEQUENCE_TABLE;
-
-/**
- * Get next consecutive sequence number for a scope using atomic DynamoDB counter
- * @param {string} scope - Scope identifier (e.g., "user:123:chat")
- * @returns {Promise<number>} Next sequence number
- */
-async function getNextSequence(scope) {
-    const command = new UpdateCommand({
-        TableName: SEQUENCE_TABLE,
-        Key: { scope },
-        UpdateExpression: 'ADD #seq :inc',
-        ExpressionAttributeNames: { '#seq': 'sequence' },
-        ExpressionAttributeValues: { ':inc': 1 },
-        ReturnValues: 'UPDATED_NEW',
-    });
-    
-    const result = await docClient.send(command);
-    return result.Attributes.sequence;
-}
-
 exports.handler = async (event) => {
     try {
-        console.log('Received event:', JSON.stringify(event, null, 2));
 
         const cognitoUserId = event.requestContext.authorizer.claims.sub;
 
@@ -38,7 +16,6 @@ exports.handler = async (event) => {
             messageBody = JSON.parse(event.body || '{}');
         } 
         catch (e) {
-            console.log('Error while parsing body:', e);
             return {
                 statusCode: 400,
                 headers: {
@@ -79,7 +56,6 @@ exports.handler = async (event) => {
         const { targetChannel, payload, messageType = 'standard', messageGroupId, generateSequence } = messageBody;
 
         if (!targetChannel || !payload ) {
-            console.error('Missing parameter in body.');
             return {
                 statusCode: 400,
                 headers: {
@@ -94,7 +70,6 @@ exports.handler = async (event) => {
 
         // Validate messageType
         if (messageType !== 'fifo' && messageType !== 'standard') {
-            console.error('Invalid messageType:', messageType);
             return {
                 statusCode: 400,
                 headers: {
@@ -107,41 +82,18 @@ exports.handler = async (event) => {
             };
         }
             
-        console.log(`Publishing ${messageType} message for cognito user ${cognitoUserId} to targetChannel ${targetChannel}`);
-
         const publishTimestamp = new Date().toISOString();
 
         const messageToPublish = {
             ...payload,
             publishTimestamp: publishTimestamp,
+            // Pass through generateSequence flag to processor for FIFO ordering
+            ...(messageType === 'fifo' && generateSequence && { generateSequence: true }),
         };
-
-        // Handle custom sequence numbers (only for FIFO messages)
-        if (messageType === 'fifo') {
-            // Option 1: Client provides their own sequence (pass through)
-            if (payload.customSequence) {
-                messageToPublish.customSequence = payload.customSequence;
-                console.log(`Using client-provided sequence: ${payload.customSequence.number} for scope ${payload.customSequence.scope}`);
-            }
-            // Option 2: Client requests Lambda to generate sequence (opt-in)
-            else if (generateSequence) {
-                const scope = payload.chatId; // Use chatId as scope
-                try {
-                    const customSeq = await getNextSequence(scope);
-                    messageToPublish.sequenceNumber = customSeq;
-                    console.log(`Generated sequence ${customSeq} for chatId ${scope}`);
-                } catch (error) {
-                    console.error('Failed to generate sequence, continuing without it:', error);
-                    // Continue without sequence - non-critical
-                }
-            }
-            // Option 3: No sequence (fastest, default)
-        }
 
         // Pass through multiPartMetadata if provided (for multi-part message completeness checking)
         if (payload.multiPartMetadata) {
             messageToPublish.multiPartMetadata = payload.multiPartMetadata;
-            console.log(`Multi-part message: ${payload.multiPartMetadata.groupId} (part ${payload.multiPartMetadata.partNumber}/${payload.multiPartMetadata.totalParts})`);
         }
 
         // Select topic based on messageType
@@ -170,21 +122,12 @@ exports.handler = async (event) => {
             // Use user-provided messageGroupId or fallback to chatId for logical grouping
             const groupId = messageGroupId || payload.chatId;
             publishParams.MessageGroupId = groupId;
-            console.log(`Using MessageGroupId: ${groupId} (${messageGroupId ? 'user-provided' : 'auto-generated from chatId'})`);
             // MessageDeduplicationId is not needed due to ContentBasedDeduplication on the topic
         }
 
         const command = new PublishCommand(publishParams);
 
         const result = await sns.send(command);
-
-        console.log('Message published successfully:', {
-            messageId: result.MessageId,
-            messageType: messageType,
-            targetChannel: targetChannel,
-            messageGroupId: messageType === 'fifo' ? (messageGroupId || cognitoUserId) : undefined,
-            topicArn: topicArn
-        });
             
         return {
             statusCode: 200,

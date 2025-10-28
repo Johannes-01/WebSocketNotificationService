@@ -13,8 +13,6 @@ const PERMISSIONS_TABLE = process.env.PERMISSIONS_TABLE;
  * GET /permissions - List user's permissions
  */
 exports.handler = async (event) => {
-  console.log('Received permission request:', JSON.stringify(event, null, 2));
-
   try {
     const httpMethod = event.httpMethod;
     const cognitoUserId = event.requestContext?.authorizer?.claims?.sub;
@@ -100,9 +98,9 @@ async function grantPermission(event, requestorUserId) {
     };
   }
 
-  // TODO: Verify requestor has admin permission for this chat
-  // For now, we'll allow any authenticated user to grant permissions
-  // In production, check if requestorUserId has 'admin' role for this chatId
+    // TODO: Verify requestor has admin permission for this chat
+    // For now, we'll allow any authenticated user to grant permissions
+    // In production, check if requestorUserId has 'admin' role for this chatId
 
   const permission = {
     userId: targetUserId,
@@ -116,8 +114,6 @@ async function grantPermission(event, requestorUserId) {
     TableName: PERMISSIONS_TABLE,
     Item: permission,
   }));
-
-  console.log(`Permission granted: ${targetUserId} → ${chatId} (${role})`);
 
   return {
     statusCode: 200,
@@ -164,8 +160,6 @@ async function revokePermission(event, requestorUserId) {
     },
   }));
 
-  console.log(`Permission revoked: ${targetUserId} → ${chatId}`);
-
   return {
     statusCode: 200,
     headers: {
@@ -187,6 +181,7 @@ async function listPermissions(event, requestorUserId) {
   // In production, add permission checks here
   const targetUserId = event.queryStringParameters?.userId || requestorUserId;
 
+  // TODO: add pagination
   const result = await dynamoDB.send(new QueryCommand({
     TableName: PERMISSIONS_TABLE,
     KeyConditionExpression: 'userId = :userId',

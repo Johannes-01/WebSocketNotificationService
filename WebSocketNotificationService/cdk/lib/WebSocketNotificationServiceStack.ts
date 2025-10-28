@@ -11,7 +11,6 @@ import * as iam from 'aws-cdk-lib/aws-iam';
 import * as congnito from 'aws-cdk-lib/aws-cognito';
 import { Construct } from 'constructs';
 import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
-import * as cloudwatch_actions from 'aws-cdk-lib/aws-cloudwatch-actions';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import { SqsEventSource } from 'aws-cdk-lib/aws-lambda-event-sources';
 
@@ -58,6 +57,7 @@ export class WebSocketNotificationService extends cdk.Stack {
       topicName: `${stackName}-Notifications.fifo`,
       fifo: true,
       contentBasedDeduplication: true,
+      fifoThroughputScope: sns.FifoThroughputScope.MESSAGE_GROUP, // high throughput within message groups, as scope of deduplication is within each individual message group instead of the entire topic
     });
 
     // standard topic, lower latency
@@ -70,11 +70,13 @@ export class WebSocketNotificationService extends cdk.Stack {
     const webSocketFifoDlq = new sqs.Queue(this, 'WebSocketFifoDLQ', {
       queueName: `${stackName}-WebSocketFifoDLQ.fifo`,
       fifo: true,
+      retentionPeriod: cdk.Duration.days(14), // Max retention period
     });
 
     // DLQ for failed WebSocket Standard notifications
     const webSocketStandardDlq = new sqs.Queue(this, 'WebSocketStandardDLQ', {
       queueName: `${stackName}-WebSocketStandardDLQ`,
+      retentionPeriod: cdk.Duration.days(14), // Max retention period
     });
 
     // SQS FIFO Queue to buffer WebSocket messages for the processor
@@ -86,8 +88,10 @@ export class WebSocketNotificationService extends cdk.Stack {
         maxReceiveCount: 3,
         queue: webSocketFifoDlq,
       },
-      deduplicationScope: sqs.DeduplicationScope.MESSAGE_GROUP,
+      // deduplicationScope: sqs.DeduplicationScope.MESSAGE_GROUP,
       fifoThroughputLimit: sqs.FifoThroughputLimit.PER_MESSAGE_GROUP_ID,
+      retentionPeriod: cdk.Duration.days(13),
+      // contentBasedDeduplication: true,
     });
 
     // SQS Standard Queue to buffer WebSocket messages for the processor (high-throughput, reliable)
@@ -98,6 +102,7 @@ export class WebSocketNotificationService extends cdk.Stack {
         maxReceiveCount: 3,
         queue: webSocketStandardDlq,
       },
+      retentionPeriod: cdk.Duration.days(13),
     });
 
     // Subscribe the SQS FIFO queue to the SNS FIFO topic with targetChannel filter
@@ -127,7 +132,7 @@ export class WebSocketNotificationService extends cdk.Stack {
       visibilityTimeout: cdk.Duration.seconds(60),
     });
 
-    // Subscribe storage queue to BOTH SNS topics (all messages regardless of type)
+    // Subscribe storage queue to BOTH SNS topics (all messages regardless of type standard or fifo)
     notificationFifoTopic.addSubscription(new subscription.SqsSubscription(messageStorageQueue, {
       filterPolicy: {
         targetChannel: sns.SubscriptionFilter.stringFilter({
@@ -170,7 +175,7 @@ export class WebSocketNotificationService extends cdk.Stack {
     // Message Storage Table for persistent message history (30 days retention)
     const messageStorageTable = new dynamodb.Table(this, 'MessageStorageTable', {
       partitionKey: { name: 'chatId', type: dynamodb.AttributeType.STRING },
-      sortKey: { name: 'timestamp', type: dynamodb.AttributeType.STRING },
+      sortKey: { name: 'publishedAt', type: dynamodb.AttributeType.STRING },
       billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
       timeToLiveAttribute: 'ttl',
       removalPolicy: cdk.RemovalPolicy.DESTROY, // Use RETAIN in production
@@ -266,16 +271,21 @@ export class WebSocketNotificationService extends cdk.Stack {
       environment: {
         FIFO_TOPIC_ARN: notificationFifoTopic.topicArn,
         STANDARD_TOPIC_ARN: notificationTopic.topicArn,
-        SEQUENCE_TABLE: sequenceTable.tableName,
       },
       timeout: cdk.Duration.seconds(10),
-      reservedConcurrentExecutions: 1,
       tracing: lambda.Tracing.ACTIVE,
+    });
+
+    // add provisioned concurrency to reduce cold starts
+    const p2pWebSocketPublisherVersion = p2pWebSocketPublisher.currentVersion;
+    const p2pWebSocketPublisherAlias = new lambda.Alias(this, 'P2PWebSocketPublisherAlias', {
+      aliasName: 'live',
+      version: p2pWebSocketPublisherVersion,
+      provisionedConcurrentExecutions: 1,
     });
 
     notificationFifoTopic.grantPublish(p2pWebSocketPublisher);
     notificationTopic.grantPublish(p2pWebSocketPublisher);
-    sequenceTable.grantReadWriteData(p2pWebSocketPublisher);
 
     webSocketApi.addRoute('$default', {
       integration: new integrations.WebSocketLambdaIntegration(
@@ -285,12 +295,16 @@ export class WebSocketNotificationService extends cdk.Stack {
     });
 
     webSocketApi.grantManageConnections(connectionHandler);
+    webSocketApi.grantManageConnections(p2pWebSocketPublisher); // Grant permissions for ACK messages
 
     const WebSocketApiStage = new apigatewayv2.WebSocketStage(this, 'DevelopmentStage', {
       webSocketApi,
       stageName: 'dvl',
       autoDeploy: true,
     });
+
+    // Add WebSocket API endpoint to p2pWebSocketPublisher for ACK functionality
+    p2pWebSocketPublisher.addEnvironment('WEBSOCKET_API_ENDPOINT', WebSocketApiStage.url.replace('wss://', 'https://'));
 
     connectionHandler.addPermission('WebSocketApiPermission', {
       action: 'lambda:InvokeFunction',
@@ -333,6 +347,7 @@ export class WebSocketNotificationService extends cdk.Stack {
           'X-Amz-Date',
           'X-Api-Key',
           'X-Amz-Security-Token',
+          'origin',
         ],
         allowCredentials: false,
       }
@@ -348,27 +363,55 @@ export class WebSocketNotificationService extends cdk.Stack {
       environment: {
       FIFO_TOPIC_ARN: notificationFifoTopic.topicArn,
       STANDARD_TOPIC_ARN: notificationTopic.topicArn,
-      SEQUENCE_TABLE: sequenceTable.tableName,
+      PERMISSIONS_TABLE: userChatPermissionsTable.tableName,
       },
       timeout: cdk.Duration.seconds(10),
-      reservedConcurrentExecutions: 1,
       tracing: lambda.Tracing.ACTIVE,
+    });
+
+    // add provisioned concurrency to reduce cold starts
+    const a2pHttpPublisherVersion = a2pHttpPublisher.currentVersion;
+    const a2pHttpPublisherAlias = new lambda.Alias(this, 'A2PHttpPublisherAlias', {
+      aliasName: 'live',
+      version: a2pHttpPublisherVersion,
+      provisionedConcurrentExecutions: 1,
     });
 
     notificationFifoTopic.grantPublish(a2pHttpPublisher);
     notificationTopic.grantPublish(a2pHttpPublisher);
-    sequenceTable.grantReadWriteData(a2pHttpPublisher);
+    userChatPermissionsTable.grantReadData(a2pHttpPublisher);
     
     const cognitoAuthorizer = new apigateway.CognitoUserPoolsAuthorizer(this, 'CognitoAuthorizer', {
       cognitoUserPools: [userPool],
       authorizerName: 'CognitoNotificationApiAuthorizer',
       identitySource: 'method.request.header.Authorization',
+      resultsCacheTtl: cdk.Duration.hours(1), // max. 1 hour caching
     });
 
-    const a2pHttpPublishIntegration = new apigateway.LambdaIntegration(a2pHttpPublisher);
+    const a2pHttpPublishIntegration = new apigateway.LambdaIntegration(a2pHttpPublisher, {
+        integrationResponses: [
+          {
+            statusCode: '200',
+            responseParameters: {
+              'method.response.header.Access-Control-Allow-Origin': "'*'",
+              'method.response.header.Access-Control-Allow-Headers': "'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token'",
+              'method.response.header.Access-Control-Allow-Methods': "'GET,POST,DELETE,OPTIONS'",
+            },
+          },
+        ],
+    });
+
     publishResource.addMethod('POST', a2pHttpPublishIntegration, {
       authorizer: cognitoAuthorizer,
       authorizationType: apigateway.AuthorizationType.COGNITO,
+      methodResponses: [{
+        statusCode: '200',
+        responseParameters: {
+          'method.response.header.Access-Control-Allow-Origin': true,
+          'method.response.header.Access-Control-Allow-Headers': true,
+          'method.response.header.Access-Control-Allow-Methods': true,
+        },
+      }],
     });
 
     // Output the REST API URL
@@ -384,27 +427,37 @@ export class WebSocketNotificationService extends cdk.Stack {
       code: lambda.Code.fromAsset('../processor'),
       environment: {
         CONNECTION_TABLE: connectionTable.tableName,
+        SEQUENCE_TABLE: sequenceTable.tableName, // Sequence generation moved to processor (after FIFO ordering)
         // Convert WebSocket URL to HTTPS URL for management API
         WS_API_ENDPOINT: WebSocketApiStage.url.replace('wss://', 'https://'),
       },
       timeout: cdk.Duration.seconds(60),
-      reservedConcurrentExecutions: 1,
       tracing: lambda.Tracing.ACTIVE,
+    });
+
+    // add provisioned concurrency to reduce cold starts
+    const processorVersion = processorLambda.currentVersion;
+    const processorAlias = new lambda.Alias(this, 'ProcessorAlias', {
+      aliasName: 'live',
+      version: processorVersion,
+      provisionedConcurrentExecutions: 1,
     });
 
     // SQS event source for FIFO messages (ordered, deduplicated)
     processorLambda.addEventSource(new SqsEventSource(webSocketFifoQueue, {
-      batchSize: 1,
+      batchSize: 1, // ensures strict ordering by processing one message at a time
       reportBatchItemFailures: true,
     }));
 
     // SQS event source for Standard messages (high-throughput, reliable)
     processorLambda.addEventSource(new SqsEventSource(webSocketStandardQueue, {
-      batchSize: 1, // Higher batch size for standard queue for better throughput
+      batchSize: 10, // Process up to 10 messages per batch
+      maxBatchingWindow: cdk.Duration.seconds(0), // Don't wait - process immediately for low latency!
       reportBatchItemFailures: true,
     }));
 
     connectionTable.grantReadWriteData(processorLambda);
+    sequenceTable.grantReadWriteData(processorLambda); // Grant sequence generation access
 
     // Grant permissions to manage WebSocket connections
     processorLambda.addToRolePolicy(new iam.PolicyStatement({
@@ -429,7 +482,6 @@ export class WebSocketNotificationService extends cdk.Stack {
         MESSAGE_STORAGE_TABLE: messageStorageTable.tableName,
       },
       timeout: cdk.Duration.seconds(30),
-      reservedConcurrentExecutions: 5,
     });
 
     // SQS event source for message storage
@@ -532,7 +584,7 @@ export class WebSocketNotificationService extends cdk.Stack {
 
     // ===========================================================
     // ===== Metric Collector Lambda =====
-    // Collects client-side metrics for end-to-end latency tracking
+    // Collects client-side END-TO-END LATENCY metrics only
     // ===========================================================
     const metricCollectorLambda = new lambda.Function(this, 'MetricCollectorLambda', {
       functionName: `${stackName}-MetricCollector`,
@@ -553,135 +605,53 @@ export class WebSocketNotificationService extends cdk.Stack {
       }
     );
 
-    // CloudWatch Alarm for ProcessorLambda Duration (P90)
-    /*const p95LatencyAlarm = new cloudwatch.Alarm(this, 'P95LatencyAlarm', {
-      metric: processorLambda.metricDuration({
-        period: cdk.Duration.minutes(5),
-        statistic: 'p95',
-      }),
-      threshold: 500, // 0.5 seconds for p95
-      evaluationPeriods: 1,
-      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
-      alarmDescription: 'Alarm if the 95th percentile latency exceeds 500 Milliseconds over a 5 minute period.',
-      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
-    });*/
-
-    // High Latency Count Alarm (count of messages over threshold)
-    const highLatencyCountFilter = processorLambda.logGroup.addMetricFilter('HighLatencyCountFilter', {
+    // Extracts latency from client-side metric submissions
+    const endToEndLatencyFilter = metricCollectorLambda.logGroup.addMetricFilter('EndToEndLatencyFilter', {
       filterPattern: logs.FilterPattern.all(
         logs.FilterPattern.exists('$.event_type'),
-        logs.FilterPattern.stringValue('$.event_type', '=', 'latency_measurement'),
-        logs.FilterPattern.numberValue('$.latency_ms', '>', 1000)
-      ), // Messages over 1000ms (1 second)
-      metricName: 'HighLatencyMessageCount',
-      metricNamespace: 'NotificationService',
-      metricValue: '1', // Count each occurrence
-      unit: cloudwatch.Unit.COUNT,
-    });
-
-    /*const highLatencyCountAlarm = new cloudwatch.Alarm(this, 'HighLatencyCountAlarm', {
-      metric: highLatencyCountFilter.metric({
-        period: cdk.Duration.minutes(5),
-        statistic: 'Sum',
-      }),
-      threshold: 10, // Alert if more than 10 high-latency messages in 5 minutes
-      evaluationPeriods: 1,
-      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
-      alarmDescription: 'Alarm if more than 10 messages exceed 3 seconds latency in a 5 minute period.',
-      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
-    });*/
-
-    // Metric Filter to extract Publisher → Processor latency from structured JSON logs
-    // This measures the time from when a message is published until it reaches the processor Lambda
-    const latencyMetricFilter = processorLambda.logGroup.addMetricFilter('PublisherToProcessorLatencyFilter', {
-      // Filter only logs that contain latency measurements
-      filterPattern: logs.FilterPattern.all(
-        logs.FilterPattern.exists('$.event_type'),
-        logs.FilterPattern.stringValue('$.event_type', '=', 'latency_measurement'),
+        logs.FilterPattern.stringValue('$.event_type', '=', 'end_to_end_latency'),
         logs.FilterPattern.exists('$.latency_ms')
       ),
-      metricName: 'PublisherToProcessorLatency',
+      metricName: 'EndToEndLatency',
       metricNamespace: 'NotificationService',
       metricValue: '$.latency_ms',
       unit: cloudwatch.Unit.MILLISECONDS,
-      defaultValue: 0, // Important: provides default value when no logs match
     });
 
-    // CloudWatch Alarm for Average Latency
-    /*const averageLatencyAlarm = new cloudwatch.Alarm(this, 'AverageLatencyAlarm', {
-      metric: latencyMetricFilter.metric({
-        period: cdk.Duration.minutes(5),
-        statistic: 'Average',
-      }),
-      threshold: 2, // 2 seconds
-      evaluationPeriods: 2,
-      datapointsToAlarm: 2,
-      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
-      alarmDescription: 'Alarm if the average message latency exceeds 2 seconds over consecutive 5 minute periods.',
-      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
-    });*/
+    // High Latency Message Counter (messages exceeding 1 second)
+    const highLatencyFilter = metricCollectorLambda.logGroup.addMetricFilter('HighLatencyFilter', {
+      filterPattern: logs.FilterPattern.all(
+        logs.FilterPattern.exists('$.event_type'),
+        logs.FilterPattern.stringValue('$.event_type', '=', 'end_to_end_latency'),
+        logs.FilterPattern.numberValue('$.latency_ms', '>', 1000)
+      ),
+      metricName: 'HighLatencyMessageCount',
+      metricNamespace: 'NotificationService',
+      metricValue: '1',
+      unit: cloudwatch.Unit.COUNT,
+    });
 
-    // Action for the alarms: notify the SNS topic
-    // const snsAction = new cloudwatch_actions.SnsAction(notificationFifoTopic);
-    // processorErrorAlarm.addAlarmAction(snsAction);
-    // p95LatencyAlarm.addAlarmAction(snsAction);
-    // averageLatencyAlarm.addAlarmAction(snsAction);
-    // highLatencyCountAlarm.addAlarmAction(snsAction);
-
-
-    // ===== CloudWatch Dashboard =====
     const latencyDashboard = new cloudwatch.Dashboard(this, 'LatencyDashboard', {
-      dashboardName: 'NotificationService-Latency',
-    })
+      dashboardName: 'NotificationService-E2E-Latency',
+    });
 
-    const latencyMetric = latencyMetricFilter.metric({
+    const e2eMetric = endToEndLatencyFilter.metric({
       period: cdk.Duration.minutes(1),
     });
 
-    // Client-side metric filters
-    const clientE2ELatencyFilter = metricCollectorLambda.logGroup.addMetricFilter('ClientE2ELatencyFilter', {
-      filterPattern: logs.FilterPattern.all(
-        logs.FilterPattern.exists('$.metric_name'),
-        logs.FilterPattern.stringValue('$.metric_name', '=', 'EndToEndLatency'),
-      ),
-      metricName: 'ClientEndToEndLatency',
-      metricNamespace: 'NotificationService/Client',
-      metricValue: '$.metric_value',
-      unit: cloudwatch.Unit.MILLISECONDS,
-    });
-
-    const clientNetworkLatencyFilter = metricCollectorLambda.logGroup.addMetricFilter('ClientNetworkLatencyFilter', {
-      filterPattern: logs.FilterPattern.all(
-        logs.FilterPattern.exists('$.metric_name'),
-        logs.FilterPattern.stringValue('$.metric_name', '=', 'NetworkLatency'),
-      ),
-      metricName: 'ClientNetworkLatency',
-      metricNamespace: 'NotificationService/Client',
-      metricValue: '$.metric_value',
-      unit: cloudwatch.Unit.MILLISECONDS,
-    });
-
-    const clientJitterFilter = metricCollectorLambda.logGroup.addMetricFilter('ClientJitterFilter', {
-      filterPattern: logs.FilterPattern.all(
-        logs.FilterPattern.exists('$.metric_name'),
-        logs.FilterPattern.stringValue('$.metric_name', '=', 'Jitter'),
-      ),
-      metricName: 'ClientJitter',
-      metricNamespace: 'NotificationService/Client',
-      metricValue: '$.metric_value',
-      unit: cloudwatch.Unit.MILLISECONDS,
+    const highLatencyMetric = highLatencyFilter.metric({
+      period: cdk.Duration.minutes(1),
     });
 
     latencyDashboard.addWidgets(
-      // PRIMARY: End-to-End Latency Percentiles (Publisher → Client)
-      // This is the most important metric for user experience
+      // Widget 1: Percentiles over time (P50, P90, P95, P99)
       new cloudwatch.GraphWidget({
-        title: 'End-to-End Latency (Publisher → Client) - Percentiles',
+        title: 'End-to-End Latency - Percentiles (Publisher → Client)',
         left: [
-          clientE2ELatencyFilter.metric().with({ statistic: 'p50', label: 'P50 (Median)', color: '#2CA02C' }),
-          clientE2ELatencyFilter.metric().with({ statistic: 'p90', label: 'P90', color: '#FF7F0E' }),
-          clientE2ELatencyFilter.metric().with({ statistic: 'p95', label: 'P95', color: '#D62728' }),
-          clientE2ELatencyFilter.metric().with({ statistic: 'p99', label: 'P99', color: '#9467BD' }),
+          e2eMetric.with({ statistic: 'p50', label: 'P50 (Median)', color: '#2CA02C' }),
+          e2eMetric.with({ statistic: 'p90', label: 'P90', color: '#FF7F0E' }),
+          e2eMetric.with({ statistic: 'p95', label: 'P95', color: '#D62728' }),
+          e2eMetric.with({ statistic: 'p99', label: 'P99', color: '#9467BD' }),
         ],
         width: 24,
         height: 6,
@@ -692,42 +662,13 @@ export class WebSocketNotificationService extends cdk.Stack {
         view: cloudwatch.GraphWidgetView.TIME_SERIES,
       }),
 
-      // Latency Breakdown: Component Comparison
-      new cloudwatch.GraphWidget({
-        title: 'Latency Breakdown: Publisher→Processor vs Processor→Client',
-        left: [
-          latencyMetric.with({ 
-            statistic: 'Average', 
-            label: 'Publisher→Processor (Avg)',
-            color: '#FF9900',
-          }),
-          clientNetworkLatencyFilter.metric().with({ 
-            statistic: 'Average', 
-            label: 'Processor→Client (Avg)',
-            color: '#1F77B4',
-          }),
-          clientE2ELatencyFilter.metric().with({ 
-            statistic: 'Average', 
-            label: 'Total E2E (Avg)',
-            color: '#2CA02C',
-          }),
-        ],
-        period: cdk.Duration.minutes(1),
-        width: 12,
-        height: 6,
-        leftYAxis: {
-          label: 'Milliseconds',
-          min: 0,
-        },
-      }),
-
-      // E2E Latency Statistics (Avg, Min, Max)
+      // Widget 2: Average, Min, Max
       new cloudwatch.GraphWidget({
         title: 'End-to-End Latency - Average & Extremes',
         left: [
-          clientE2ELatencyFilter.metric().with({ statistic: 'Average', label: 'Average', color: '#1F77B4' }),
-          clientE2ELatencyFilter.metric().with({ statistic: 'Minimum', label: 'Minimum', color: '#2CA02C' }),
-          clientE2ELatencyFilter.metric().with({ statistic: 'Maximum', label: 'Maximum', color: '#D62728' }),
+          e2eMetric.with({ statistic: 'Average', label: 'Average', color: '#1F77B4' }),
+          e2eMetric.with({ statistic: 'Minimum', label: 'Minimum', color: '#2CA02C' }),
+          e2eMetric.with({ statistic: 'Maximum', label: 'Maximum', color: '#D62728' }),
         ],
         width: 12,
         height: 6,
@@ -737,89 +678,66 @@ export class WebSocketNotificationService extends cdk.Stack {
         },
       }),
 
-      // Publisher → Processor Latency Percentiles (for debugging)
+      // Widget 3: Message count and high latency count
       new cloudwatch.GraphWidget({
-        title: 'Publisher → Processor Latency - Percentiles',
+        title: 'Message Throughput & High Latency Count (>1s)',
         left: [
-          latencyMetric.with({ statistic: 'p50', label: 'P50', color: '#2CA02C' }),
-          latencyMetric.with({ statistic: 'p90', label: 'P90', color: '#FF7F0E' }),
-          latencyMetric.with({ statistic: 'p95', label: 'P95', color: '#D62728' }),
-          latencyMetric.with({ statistic: 'p99', label: 'P99', color: '#9467BD' }),
+          e2eMetric.with({ statistic: 'SampleCount', label: 'Total Messages', color: '#1F77B4' }),
         ],
-        period: cdk.Duration.minutes(1),
-        width: 12,
-        height: 6,
-        leftYAxis: {
-          min: 0,
-          label: 'Milliseconds',
-        },
-      }),
-
-      // Network Latency Percentiles (Processor → Client)
-      new cloudwatch.GraphWidget({
-        title: 'Network Latency (Processor → Client) - Percentiles',
-        left: [
-          clientNetworkLatencyFilter.metric().with({ statistic: 'p50', label: 'P50', color: '#2CA02C' }),
-          clientNetworkLatencyFilter.metric().with({ statistic: 'p90', label: 'P90', color: '#FF7F0E' }),
-          clientNetworkLatencyFilter.metric().with({ statistic: 'p95', label: 'P95', color: '#D62728' }),
-          clientNetworkLatencyFilter.metric().with({ statistic: 'p99', label: 'P99', color: '#9467BD' }),
+        right: [
+          highLatencyMetric.with({ statistic: 'SampleCount', label: 'High Latency Messages (>1000ms)', color: '#D62728' }),
         ],
         width: 12,
         height: 6,
         leftYAxis: {
-          label: 'Milliseconds',
           min: 0,
-        },
-      }),
-
-      // Jitter
-      new cloudwatch.GraphWidget({
-        title: 'Latency Jitter - Percentiles',
-        left: [
-          clientJitterFilter.metric().with({ statistic: 'p50', label: 'P50 Jitter', color: '#2CA02C' }),
-          clientJitterFilter.metric().with({ statistic: 'p90', label: 'P90 Jitter', color: '#FF7F0E' }),
-          clientJitterFilter.metric().with({ statistic: 'p95', label: 'P95 Jitter', color: '#D62728' }),
-        ],
-        width: 12,
-        height: 6,
-        leftYAxis: {
-          label: 'Milliseconds',
-          min: 0,
-          showUnits: true,
-        },
-      }),
-    
-      // Message throughput and high latency count
-      new cloudwatch.GraphWidget({
-        title: 'Message Throughput & High Latency Count',
-        left: [latencyMetric.with({ statistic: 'SampleCount', label: 'Total Messages' })],
-        right: [highLatencyCountFilter.metric().with({ statistic: 'Sum', label: 'High Latency Messages' })],
-        period: cdk.Duration.minutes(1),
-        width: 12,
-        height: 6,
-        leftYAxis: {
-          min: 0,
-          label: 'Count',
-          showUnits: true,
+          label: 'Message Count',
         },
         rightYAxis: {
           min: 0,
           label: 'High Latency Count',
-          showUnits: true,
         },
       }),
-    
-      // Alarm status
-      /*new cloudwatch.SingleValueWidget({
-        title: 'Alarm Status',
+
+      // Widget 4: Single value - Current average
+      new cloudwatch.SingleValueWidget({
+        title: 'Current Average E2E Latency',
         metrics: [
-          averageLatencyAlarm.metric,
-          p95LatencyAlarm.metric,
-          highLatencyCountAlarm.metric,
+          e2eMetric.with({ statistic: 'Average', label: 'Avg Latency' }),
         ],
-        width: 12,
-        height: 3,
-      })*/
+        width: 6,
+        height: 4,
+      }),
+
+      // Widget 5: Single value - Current P95
+      new cloudwatch.SingleValueWidget({
+        title: 'Current P95 Latency',
+        metrics: [
+          e2eMetric.with({ statistic: 'p95', label: 'P95 Latency' }),
+        ],
+        width: 6,
+        height: 4,
+      }),
+
+      // Widget 6: Single value - Message count
+      new cloudwatch.SingleValueWidget({
+        title: 'Total Messages (1 min)',
+        metrics: [
+          e2eMetric.with({ statistic: 'SampleCount', label: 'Messages' }),
+        ],
+        width: 6,
+        height: 4,
+      }),
+
+      // Widget 7: Single value - High latency count
+      new cloudwatch.SingleValueWidget({
+        title: 'High Latency Messages (1 min)',
+        metrics: [
+          highLatencyMetric.with({ statistic: 'Sum', label: 'High Latency' }),
+        ],
+        width: 6,
+        height: 4,
+      }),
     );
 
     // ============================================

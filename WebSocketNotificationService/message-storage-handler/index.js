@@ -12,8 +12,6 @@ const TTL_DAYS = 30; // Message retention period
  * Processes SQS events from SNS topics (both FIFO and Standard)
  */
 const processRecord = async (record) => {
-  console.log('Processing storage record:', record.messageId);
-
   try {
     // Parse SNS message
     const snsMessage = JSON.parse(record.body);
@@ -36,13 +34,13 @@ const processRecord = async (record) => {
     const ttl = Math.floor(Date.now() / 1000) + (TTL_DAYS * 24 * 60 * 60);
 
     // Store message in DynamoDB
+    // Note: Only include sequenceNumber if it exists (GSI requirement - no null values)
     const item = {
       chatId,
-      timestamp: publishTimestamp,
+      timestamp: publishTimestamp, // Using 'timestamp' as the sort key (not 'publishedAt')
       messageId: record.messageId,
-      sequenceNumber: sequenceNumber || null,
+      ...(sequenceNumber !== undefined && sequenceNumber !== null && { sequenceNumber }), // Only include if exists
       messageData,
-      storedAt: new Date().toISOString(),
       ttl,
     };
 
@@ -51,26 +49,23 @@ const processRecord = async (record) => {
       Item: item,
     }));
 
-    console.log(`Message stored successfully for chatId: ${chatId}`);
   } catch (error) {
-    console.error('Error storing message:', error);
+    console.error('Error storing message:', error.message);
     throw error; // Re-throw to trigger SQS retry
   }
 };
 
 exports.handler = async (event) => {
-  console.log(`Received SQS event with ${event.Records.length} records for storage.`);
   const batchItemFailures = [];
 
   for (const record of event.Records) {
     try {
       await processRecord(record);
     } catch (error) {
-      console.error(`Failed to store record ${record.messageId}:`, error);
+      console.error(`Failed to store record ${record.messageId}:`, error.message);
       batchItemFailures.push({ itemIdentifier: record.messageId });
     }
   }
 
-  console.log(`Storage processing complete. Failures: ${batchItemFailures.length}`);
   return { batchItemFailures };
 };

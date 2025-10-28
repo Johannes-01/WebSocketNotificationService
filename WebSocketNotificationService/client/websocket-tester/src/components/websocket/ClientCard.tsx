@@ -241,12 +241,6 @@ export default function ClientCard({
                   </div>
                 )}
                 
-                {msg.networkLatency !== undefined && (
-                  <div className="mt-0.5 text-[10px] text-gray-600">
-                    Net: {msg.networkLatency}ms
-                  </div>
-                )}
-                
                 {msg.payload && (
                   <details className="mt-1">
                     <summary className="text-[10px] text-gray-600 cursor-pointer">Payload</summary>
