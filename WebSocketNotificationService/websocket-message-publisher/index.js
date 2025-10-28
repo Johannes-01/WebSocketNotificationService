@@ -56,30 +56,6 @@ exports.handler = async (event) => {
             };
         }
 
-        /**
-         * Expected WebSocket message format:
-         {
-            "action": "sendMessage", // WebSocket action (handled by $default route)
-            "targetChannel": "WebSocket", // WebSocket, Email, SMS, etc.
-            "messageType": "fifo", // "fifo" or "standard" (optional, defaults to "standard")
-            "messageGroupId": "chat-123", // Optional: for FIFO grouping (defaults to chatId)
-            "generateSequence": true, // Optional: only for FIFO, generates DynamoDB sequence
-            "payload": {
-                "chatId": "chat-123",      // Target chat ID
-                "eventType": "notification",
-                "content": "Message content",
-                "customSequence": { // Optional: client can provide their own sequence
-                    "number": 42,
-                    "scope": "chat-123"
-                },
-                "multiPartMetadata": { // Optional: for tracking multi-part messages
-                    "groupId": "file-upload-xyz",
-                    "totalParts": 5,
-                    "partNumber": 1
-                }
-            }
-         }
-         */
         const { targetChannel, payload, messageType = 'standard', messageGroupId, generateSequence } = messageBody;
 
         if (!targetChannel || !payload) {
@@ -114,11 +90,6 @@ exports.handler = async (event) => {
             ...(messageType === 'fifo' && generateSequence && { generateSequence: true }),
         };
 
-        // Pass through multiPartMetadata if provided (for multi-part message completeness checking)
-        if (payload.multiPartMetadata) {
-            messageToPublish.multiPartMetadata = payload.multiPartMetadata;
-        }
-
         // Select topic based on messageType
         const topicArn = messageType === 'fifo' 
             ? process.env.FIFO_TOPIC_ARN 
@@ -132,10 +103,6 @@ exports.handler = async (event) => {
                 targetChannel: {
                     DataType: 'String',
                     StringValue: targetChannel,
-                },
-                timestamp: {
-                    DataType: 'String',
-                    StringValue: publishTimestamp,
                 }
             },
         };

@@ -19,7 +19,7 @@ const processRecord = async (record) => {
 
     const {
       chatId,
-      publishTimestamp,
+      publishTimestamp, // Message uses 'publishTimestamp' in SNS
       sequenceNumber, // Optional: custom consecutive sequence
       ...messageData
     } = message;
@@ -33,11 +33,9 @@ const processRecord = async (record) => {
     // Calculate TTL (30 days from now)
     const ttl = Math.floor(Date.now() / 1000) + (TTL_DAYS * 24 * 60 * 60);
 
-    // Store message in DynamoDB
-    // Note: Only include sequenceNumber if it exists (GSI requirement - no null values)
     const item = {
       chatId,
-      timestamp: publishTimestamp, // Using 'timestamp' as the sort key (not 'publishedAt')
+      publishedAt: publishTimestamp, // Rename field to match DynamoDB sort key
       messageId: record.messageId,
       ...(sequenceNumber !== undefined && sequenceNumber !== null && { sequenceNumber }), // Only include if exists
       messageData,

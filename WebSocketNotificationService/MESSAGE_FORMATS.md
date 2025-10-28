@@ -4,12 +4,13 @@ This document describes all supported message structures for publishing to the W
 
 ## Table of Contents
 1. [Base Message Structure](#base-message-structure)
-2. [Publishing Methods](#publishing-methods)
-3. [Message Types](#message-types)
-4. [Optional Features](#optional-features)
-5. [Complete Examples](#complete-examples)
-6. [Target Classes](#target-classes)
-7. [Validation Rules](#validation-rules)
+2. [Payload Extensibility](#payload-extensibility)
+3. [Publishing Methods](#publishing-methods)
+4. [Message Types](#message-types)
+5. [Optional Features](#optional-features)
+6. [Complete Examples](#complete-examples)
+7. [Target Classes](#target-classes)
+8. [Validation Rules](#validation-rules)
 
 ---
 
@@ -38,7 +39,7 @@ All messages share a common structure with required and optional fields.
 {
   "messageType": "fifo" | "standard",        // Default: "standard"
   "messageGroupId": string,                  // FIFO only: custom ordering group
-  // Note: FIFO messages automatically request sequence numbers
+  "generateSequence": boolean,               // FIFO only: triggers DynamoDB sequence generation
 }
 ```
 
@@ -58,10 +59,198 @@ All messages share a common structure with required and optional fields.
       "groupId": string,
       "totalParts": number,
       "partNumber": number
+    },
+    
+    // Any custom properties you add here will be passed through
+    "yourCustomField": any,
+    "anotherCustomField": any
+  }
+}
+```
+
+---
+
+## Payload Extensibility
+
+### Custom Attributes Pass-Through
+
+**The payload is fully extensible** - you can add any custom JSON properties to the payload, and they will be passed through to the client unchanged.
+
+#### How It Works
+
+1. **Publisher** (P2P or A2P): Uses JavaScript spread operator (`...payload`) to include all payload properties
+2. **Processor**: Extracts only `chatId` and `publishTimestamp`, passes everything else through (`...messagePayload`)
+3. **Client**: Receives all original payload properties plus system-added metadata
+
+#### Implementation Evidence
+
+```javascript
+// In Publishers (websocket-message-publisher & http-message-publisher)
+const messageToPublish = {
+    ...payload,  // ← Spreads ALL payload properties
+    publishTimestamp: publishTimestamp,
+    ...(messageType === 'fifo' && generateSequence && { generateSequence: true }),
+};
+
+// In Processor
+const {
+    chatId,
+    publishTimestamp,
+    ...messagePayload  // ← Everything else goes here
+} = message;
+
+const dataToSend = JSON.stringify({
+    ...messagePayload,  // ← All custom properties passed through
+    chatId,
+    publishTimestamp,
+    ...(customSequenceNumber !== undefined && { sequenceNumber: customSequenceNumber }),
+    sqsSequenceNumber: sqsMetadata.sequenceNumber,
+    messageGroupId: sqsMetadata.messageGroupId,
+    messageId: sqsMetadata.sqsMessageId,
+    retryCount: parseInt(sqsMetadata.approximateReceiveCount) - 1,
+});
+```
+
+#### Example: Custom Business Metadata
+
+```json
+{
+  "targetChannel": "WebSocket",
+  "messageType": "fifo",
+  "generateSequence": true,
+  "payload": {
+    "chatId": "chat-123",
+    "eventType": "order-update",
+    "content": "Order shipped",
+    
+    // Your custom business properties
+    "orderId": "ORD-2025-12345",
+    "customerId": "CUST-9876",
+    "priority": "high",
+    "metadata": {
+      "warehouse": "EU-West-1",
+      "carrier": "DHL",
+      "trackingNumber": "ABC123XYZ"
+    },
+    "tags": ["urgent", "premium-customer"],
+    "internalReference": {
+      "salesRepId": "REP-456",
+      "region": "EMEA"
     }
   }
 }
 ```
+
+**Client receives**:
+```json
+{
+  "chatId": "chat-123",
+  "eventType": "order-update",
+  "content": "Order shipped",
+  "publishTimestamp": "2025-10-28T10:30:00.000Z",
+  "sequenceNumber": 42,
+  
+  // All your custom properties passed through unchanged
+  "orderId": "ORD-2025-12345",
+  "customerId": "CUST-9876",
+  "priority": "high",
+  "metadata": {
+    "warehouse": "EU-West-1",
+    "carrier": "DHL",
+    "trackingNumber": "ABC123XYZ"
+  },
+  "tags": ["urgent", "premium-customer"],
+  "internalReference": {
+    "salesRepId": "REP-456",
+    "region": "EMEA"
+  },
+  
+  // System-added metadata
+  "sqsSequenceNumber": "18779423847239847",
+  "messageGroupId": "chat-123",
+  "messageId": "abc-123-def-456",
+  "retryCount": 0
+}
+```
+
+#### Reserved Field Names
+
+The following field names are reserved and will be overwritten by the system:
+
+**Reserved in Payload** (extracted by processor):
+- `chatId` - Used for routing
+- `publishTimestamp` - Added by publishers
+
+**Reserved in Final Message** (added by processor):
+- `sequenceNumber` - Generated DynamoDB sequence (if `generateSequence: true`)
+- `sqsSequenceNumber` - SQS FIFO sequence
+- `messageGroupId` - FIFO grouping scope
+- `messageId` - SQS message ID
+- `retryCount` - Delivery attempt count
+
+**Safe to Use** (passed through as-is):
+- `customSequence` - Client-provided sequence
+- `multiPartMetadata` - Multi-part tracking
+- `eventType` - Application event type
+- `content` - Message content
+- Any other custom properties
+
+#### Use Cases for Custom Attributes
+
+1. **Business Context**:
+   ```json
+   "orderId": "12345",
+   "customerId": "CUST-001",
+   "transactionType": "purchase"
+   ```
+
+2. **UI Rendering Hints**:
+   ```json
+   "priority": "high",
+   "color": "#FF5733",
+   "icon": "warning-triangle",
+   "displayDuration": 5000
+   ```
+
+3. **Tracking & Analytics**:
+   ```json
+   "sourceSystem": "order-service",
+   "correlationId": "uuid-1234",
+   "analyticsCategory": "conversion"
+   ```
+
+4. **Conditional Processing**:
+   ```json
+   "requiresAck": true,
+   "expiresAt": "2025-10-28T23:59:59Z",
+   "retryPolicy": "exponential-backoff"
+   ```
+
+5. **Rich Content**:
+   ```json
+   "attachments": [
+     {"type": "image", "url": "https://..."},
+     {"type": "pdf", "url": "https://..."}
+   ],
+   "actions": [
+     {"label": "Approve", "action": "approve"},
+     {"label": "Reject", "action": "reject"}
+   ]
+   ```
+
+#### Best Practices
+
+✅ **DO**:
+- Add custom properties for your application's needs
+- Use nested objects for complex data
+- Document your custom schema for your team
+- Use consistent naming conventions
+
+❌ **DON'T**:
+- Use reserved field names (they'll be overwritten)
+- Send sensitive data without encryption
+- Make payloads excessively large (WebSocket limit is typically 128KB)
+- Assume custom fields will be validated (client-side validation needed)
 
 ---
 
@@ -126,7 +315,7 @@ All messages share a common structure with required and optional fields.
 - Best-effort delivery
 - No ordering guarantees
 - Lower latency (~100-300ms)
-- No sequence numbers
+- No sequence numbers (neither `sequenceNumber` nor `sqsSequenceNumber`)
 
 **Use Cases**: Alerts, notifications, non-critical updates
 
@@ -200,8 +389,8 @@ Transaction logs    → Sort by sequenceNumber (guaranteed correctness)
   }
 }
 ```
-**Result**: SQS sequence for ordering only (not consecutive), ~50-100ms  
-**Use Case**: When order doesn't matter or SQS sequence is sufficient
+**Result**: No sequence numbers in response, ~50-100ms  
+**Use Case**: When order doesn't matter at all
 
 ---
 
@@ -217,9 +406,10 @@ Transaction logs    → Sort by sequenceNumber (guaranteed correctness)
   }
 }
 ```
-**Result**: Lambda generates consecutive DynamoDB sequence (1,2,3...), ~100-170ms  
+**Result**: Processor generates consecutive `sequenceNumber` field (1,2,3...), ~100-170ms  
 **Use Case**: Chat, transaction logs - gap detection enabled  
-**Note**: Set `generateSequence: true` at the top level to enable
+**Note**: Set `generateSequence: true` at the top level to enable  
+**Client receives**: `sequenceNumber` (consecutive) + `sqsSequenceNumber` (non-consecutive)
 
 ---
 
@@ -238,9 +428,11 @@ Transaction logs    → Sort by sequenceNumber (guaranteed correctness)
   }
 }
 ```
-**Result**: Lambda passes through client sequence, ~80-150ms  
+**Result**: Processor passes through `customSequence` object as-is, ~80-150ms  
 **Warning**: Client must coordinate sequences to avoid conflicts  
-**Use Case**: When client already manages sequence state
+**Use Case**: When client already manages sequence state  
+**Client receives**: `customSequence` object (passed through) + `sqsSequenceNumber`  
+**Note**: If you also set `generateSequence: true`, you'll get both `sequenceNumber` AND `customSequence`
 
 ---
 
@@ -346,12 +538,16 @@ This service offers three optional tracking mechanisms. Here's when to use each:
 ```json
 {
   "messageType": "standard",
-  "payload": { "content": "Simple notification" }
+  "payload": { 
+    "chatId": "chat-123",
+    "content": "Simple notification" 
+  }
 }
 ```
 ✅ **Use for**: Alerts, notifications where order doesn't matter  
 ✅ **Latency**: ~50-100ms (fastest)  
-❌ **No**: Ordering, gap detection, or completeness tracking
+❌ **No**: Ordering, gap detection, or completeness tracking  
+📋 **Client receives**: No sequence numbers at all
 
 ---
 
@@ -359,13 +555,16 @@ This service offers three optional tracking mechanisms. Here's when to use each:
 ```json
 {
   "messageType": "fifo",
-  "payload": { "content": "Ordered message" }
+  "payload": { 
+    "chatId": "chat-123",
+    "content": "Ordered message" 
+  }
 }
 ```
 ✅ **Use for**: Messages that should be processed in order  
 ✅ **Latency**: ~80-150ms  
-✅ **Client gets**: SQS `sequenceNumber` for sorting (if needed)  
-⚠️ **Note**: Order usually preserved, but sort by sequence for critical apps
+✅ **Client gets**: `sqsSequenceNumber` for sorting (non-consecutive, but ordered)  
+⚠️ **Note**: Order usually preserved, but sort by `sqsSequenceNumber` for critical apps
 
 ---
 
@@ -382,8 +581,9 @@ This service offers three optional tracking mechanisms. Here's when to use each:
 ```
 ✅ **Use for**: Chat, transaction logs where you need to detect missing messages  
 ✅ **Latency**: ~100-170ms (+15ms for DynamoDB sequence generation)  
-✅ **Client gets**: Consecutive sequences (1,2,3...) for gap detection  
+✅ **Client receives**: `sequenceNumber` (consecutive 1,2,3...) for gap detection  
 ✅ **Can detect**: "Got 1,2,4 → missing 3!"  
+📋 **Also gets**: `sqsSequenceNumber` for additional ordering context  
 **Note**: Set `generateSequence: true` to enable sequence generation
 
 ---
@@ -393,6 +593,7 @@ This service offers three optional tracking mechanisms. Here's when to use each:
 {
   "messageType": "fifo",
   "payload": {
+    "chatId": "chat-123",
     "content": "File chunk",
     "multiPartMetadata": {
       "groupId": "file-upload-xyz",
@@ -405,7 +606,8 @@ This service offers three optional tracking mechanisms. Here's when to use each:
 ✅ **Use for**: File uploads, large messages split into chunks  
 ✅ **Latency**: ~80-150ms  
 ✅ **Client can**: Track multiple simultaneous multi-part messages  
-✅ **Benefit**: Semantic clarity ("part 2 of file xyz")
+✅ **Benefit**: Semantic clarity ("part 2 of file xyz")  
+📋 **Client receives**: `multiPartMetadata` (passed through) + `sqsSequenceNumber`
 
 ---
 
@@ -427,7 +629,7 @@ This service offers three optional tracking mechanisms. Here's when to use each:
 ```
 ✅ **Use for**: Critical file uploads where you need both gap detection AND grouping  
 ✅ **Latency**: ~100-170ms  
-✅ **Client gets**: Both consecutive sequences AND part tracking  
+✅ **Client receives**: `sequenceNumber` (consecutive) + `multiPartMetadata` + `sqsSequenceNumber`  
 ✅ **Can detect**: Missing sequences AND missing parts  
 **Note**: Set `generateSequence: true` to enable sequence generation
 
@@ -461,7 +663,7 @@ This service offers three optional tracking mechanisms. Here's when to use each:
 ```
 **Delivery Time**: ~50-100ms  
 **Ordering**: None  
-**Sequences**: SQS sequence only (for ordering, not gap detection)
+**Sequences**: None (no `sequenceNumber` or `sqsSequenceNumber` fields)
 
 ---
 
@@ -482,8 +684,8 @@ This service offers three optional tracking mechanisms. Here's when to use each:
 **Delivery Time**: ~100-170ms  
 **Processing Order**: ✅ Guaranteed per chat-room-789  
 **Delivery Order**: ⚠️ Usually preserved (< 5% chance of scrambling)  
-**Sequences**: ✅ Consecutive custom sequences (1,2,3...) for gap detection  
-**Client Action**: Sort by `customSequence.number` for guaranteed order
+**Sequences**: ✅ Consecutive sequences (1,2,3...) in `sequenceNumber` field for gap detection  
+**Client Action**: Sort by `sequenceNumber` for guaranteed order
 
 ---
 
@@ -824,10 +1026,14 @@ ws.onmessage = (event) => {
   messageBuffer.push(msg);
   
   // Sort by sequence number
-  messageBuffer.sort((a, b) => 
-    Number(a.sqsMetadata.sequenceNumber) - Number(b.sqsMetadata.sequenceNumber)
-    // OR: a.customSequence.number - b.customSequence.number
-  );
+  messageBuffer.sort((a, b) => {
+    // Use generated sequenceNumber if available (consecutive 1,2,3...)
+    if (a.sequenceNumber !== undefined && b.sequenceNumber !== undefined) {
+      return a.sequenceNumber - b.sequenceNumber;
+    }
+    // Fallback to SQS sequence (non-consecutive, but ordered)
+    return Number(a.sqsSequenceNumber) - Number(b.sqsSequenceNumber);
+  });
   
   renderMessages(messageBuffer);
 };
@@ -897,29 +1103,36 @@ Messages arrive at WebSocket clients with enriched metadata.
   // Added by Lambda publishers
   "publishTimestamp": "2025-10-12T14:30:00.000Z",
   
-  // Optional: Custom sequence (if generated or provided)
+  // Optional: Generated sequence (if generateSequence: true was set)
+  "sequenceNumber": 42,                      // Consecutive DynamoDB sequence (1,2,3...)
+  
+  // Optional: Client-provided sequence (if customSequence was in payload)
   "customSequence": {
     "number": 42,
-    "scope": "chat-123",
-    "timestamp": "2025-10-12T14:30:00.000Z"
+    "scope": "chat-123"
   },
   
-  // Optional: Multi-part metadata (if provided)
+  // Optional: Multi-part metadata (if provided in payload)
   "multiPartMetadata": {
     "groupId": "file-upload-xyz",
     "totalParts": 5,
     "partNumber": 3
   },
   
-  // Added by Processor Lambda
-  "sqsMetadata": {
-    "sequenceNumber": "18779423847239847",  // FIFO only: for ordering
-    "messageGroupId": "chat-123",            // FIFO only: ordering scope
-    "messageId": "abc-123-def-456",          // SQS message ID
-    "retryCount": 0                          // Delivery attempt count
-  }
+  // Added by Processor Lambda - SQS metadata
+  "sqsSequenceNumber": "18779423847239847",  // FIFO only: SQS sequence (for ordering)
+  "messageGroupId": "chat-123",              // FIFO only: ordering scope
+  "messageId": "abc-123-def-456",            // SQS message ID
+  "retryCount": 0                            // Delivery attempt count (0 = first delivery)
 }
 ```
+
+**Key Points**:
+- **`sequenceNumber`**: Generated by processor when `generateSequence: true` - consecutive (1,2,3...)
+- **`customSequence`**: Client-provided sequence (passed through from payload)
+- **`sqsSequenceNumber`**: Always present for FIFO messages - non-consecutive, for ordering only
+- **`messageGroupId`**: FIFO grouping scope
+- If both `sequenceNumber` and `customSequence` exist, use `sequenceNumber` for ordering
 
 ---
 
@@ -929,30 +1142,30 @@ Messages arrive at WebSocket clients with enriched metadata.
 Do you need ordering at the client?
 ├─ NO  → Use messageType: "standard"
 │        ✅ Fastest delivery
-│        ✅ SQS sequence for basic ordering
+│        ✅ No sequence numbers
 │        ✅ ~50-100ms
 │        ✅ No gap detection
 │
 └─ YES → Use messageType: "fifo"
          ✅ Ordered processing (sequential per messageGroupId)
          ⏱️  ~80-150ms base latency
-         📋 Client can sort by sqsMetadata.sequenceNumber
+         📋 Client gets sqsSequenceNumber (non-consecutive, for ordering)
          │
          Need gap detection (chat, transactions)?
          │
          ├─ NO (notifications, alerts)
          │  └─ Simple FIFO: just ordered processing
          │     ✅ Works 95%+ of the time
-         │     ✅ Sort by SQS sequence if needed
+         │     ✅ Sort by sqsSequenceNumber if needed
          │     💡 Order usually preserved (same TCP connection)
          │
          └─ YES (chat, logs, critical sequences)
             └─ FIFO with generateSequence: true
-               ✅ Consecutive sequences (1,2,3...)
+               ✅ Consecutive sequences (1,2,3...) in sequenceNumber field
                ✅ Guarantees correct display order
                ✅ Gap detection (can detect missing messages)
                ⏱️  ~100-170ms (+15ms for DynamoDB sequences)
-               📋 Sort by customSequence.number
+               📋 Sort by sequenceNumber field
 
 Multi-part message?
 └─ Add multiPartMetadata to payload
@@ -968,7 +1181,7 @@ Multi-part message?
 |---------|----------|------|------------------------|-------------------|
 | **Processing Order** | ❌ | ✅ | ✅ | ✅ |
 | **Delivery Order** | ❌ | ⚠️ Usually* | ⚠️ Usually* | ⚠️ Usually* |
-| **Client Reordering** | SQS seq | SQS seq | Custom seq** | Custom seq |
+| **Sequence Field** | None | sqsSequenceNumber | sequenceNumber** | sequenceNumber |
 | **Latency** | ~50-100ms | ~80-150ms | ~100-170ms | ~100-170ms |
 | **Gap Detection** | ❌ | ❌ | ✅ | ✅ |
 | **Completeness** | ❌ | ❌ | ✅ | ✅ (per part group) |
@@ -977,7 +1190,7 @@ Multi-part message?
 
 \* Usually in order (95%+) due to same TCP connection. Sort by sequence for critical apps.
 
-\*\* Simple apps: just append. Critical apps: sort by `customSequence.number`.
+\*\* `sequenceNumber` is consecutive (1,2,3...), `sqsSequenceNumber` is non-consecutive but ordered.
 
 ---
 

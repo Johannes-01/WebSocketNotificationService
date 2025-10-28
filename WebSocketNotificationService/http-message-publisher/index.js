@@ -123,11 +123,6 @@ exports.handler = async (event) => {
             ...(messageType === 'fifo' && generateSequence && { generateSequence: true }),
         };
 
-        // Pass through multiPartMetadata if provided (for multi-part message completeness checking)
-        if (payload.multiPartMetadata) {
-            messageToPublish.multiPartMetadata = payload.multiPartMetadata;
-        }
-
         // Select topic based on messageType
         const topicArn = messageType === 'fifo' 
             ? process.env.FIFO_TOPIC_ARN 
@@ -141,10 +136,6 @@ exports.handler = async (event) => {
                 targetChannel: {
                   DataType: 'String',
                   StringValue: targetChannel,
-                },
-                timestamp: {
-                  DataType: 'String',
-                  StringValue: publishTimestamp,
                 }
             },
         };
