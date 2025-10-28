@@ -98,7 +98,6 @@ export default function MultiClientTester() {
       };
 
       websocket.onmessage = async (event) => {
-        const clientReceiveTime = new Date(); // Capture receive time immediately
         addLog(`📨 Received message`, clientId);
         try {
           const data = JSON.parse(event.data);
@@ -106,24 +105,49 @@ export default function MultiClientTester() {
           // Track end-to-end latency if timestamps are available
           let e2eLatency: number | undefined;
 
-          if (data.publishTimestamp) {
-            const publishTime = new Date(data.publishTimestamp);
+          // Use client-side timestamp if available (no clock skew)
+          // Fall back to server timestamp (may have clock skew)
+          if (data.clientPublishTimestamp) {
+            const publishTime = new Date(data.clientPublishTimestamp);
+            const clientReceiveTime = new Date();
             
             e2eLatency = clientReceiveTime.getTime() - publishTime.getTime();
             
-            // Send metrics to the collector Lambda
+            // Should never be negative with client timestamps, but guard anyway
+            if (e2eLatency < 0) {
+              addLog(`⚠️ Unexpected negative latency: ${e2eLatency}ms (adjusted to 0ms)`, clientId);
+              e2eLatency = 0;
+            }
+            
+            addLog(`📊 Latency - E2E: ${e2eLatency}ms (client clock)`, clientId);
+          } else if (data.publishTimestamp) {
+            // Fallback to server timestamp (has potential clock skew)
+            const publishTime = new Date(data.publishTimestamp);
+            const clientReceiveTime = new Date();
+            
+            e2eLatency = clientReceiveTime.getTime() - publishTime.getTime();
+            
+            // Guard against clock skew
+            if (e2eLatency < 0) {
+              addLog(`⚠️ Clock skew detected! Latency: ${e2eLatency}ms (adjusted to 0ms)`, clientId);
+              e2eLatency = 0;
+            }
+            
+            addLog(`📊 Latency - E2E: ${e2eLatency}ms (server clock)`, clientId);
+          }
+          
+          // Send metrics to the collector Lambda (if available)
+          if (e2eLatency !== undefined && data.publishTimestamp) {
             const token = await getIdToken();
             if (token) {
               await metricsService.trackEndToEndLatency(
-                publishTime,
-                clientReceiveTime,
+                new Date(data.publishTimestamp),
+                new Date(),
                 token,
                 data.messageId,
                 data.chatId || data.payload?.chatId
               );
             }
-            
-            addLog(`📊 Latency - E2E: ${e2eLatency}ms`, clientId);
           }
           
           // Track sequence numbers if present
@@ -257,6 +281,9 @@ export default function MultiClientTester() {
       return;
     }
 
+    // Capture client publish time to avoid clock skew with server
+    const clientPublishTimestamp = new Date().toISOString();
+
     const message = {
       action: 'sendMessage',
       targetChannel: 'WebSocket',
@@ -267,7 +294,7 @@ export default function MultiClientTester() {
         chatId,
         eventType,
         content,
-        timestamp: new Date().toISOString()
+        clientPublishTimestamp, // Add client-side timestamp for accurate latency measurement
       }
     };
 
@@ -309,6 +336,9 @@ export default function MultiClientTester() {
         return;
       }
 
+      // Capture client publish time to avoid clock skew with server
+      const clientPublishTimestamp = new Date().toISOString();
+
       const message = {
         targetChannel: 'WebSocket',
         messageType,
@@ -318,7 +348,7 @@ export default function MultiClientTester() {
           chatId,
           eventType,
           content,
-          timestamp: new Date().toISOString()
+          clientPublishTimestamp, // Add client-side timestamp for accurate latency measurement
         }
       };
 

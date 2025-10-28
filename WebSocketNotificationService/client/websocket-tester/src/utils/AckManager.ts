@@ -62,19 +62,28 @@ export class AckManager {
     // Store and wrap the original onmessage handler
     this.originalOnMessage = websocket.onmessage;
     websocket.onmessage = (event: MessageEvent) => {
+      let data: any;
+      let parseError: Error | null = null;
+      
+      // Parse JSON once and reuse
       try {
-        const data = JSON.parse(event.data);
-        
-        // Handle ACK messages
-        if (data.type === 'ack') {
-          this._handleAck(data as AckResponse);
-        }
+        data = JSON.parse(event.data);
       } catch (e) {
-        // Not JSON or not an ACK, ignore for this handler
+        parseError = e as Error;
+      }
+      
+      // Handle ACK messages (if parsing succeeded)
+      if (data && data.type === 'ack') {
+        this._handleAck(data as AckResponse);
+        // Don't pass ACK messages to the original handler
+        // This prevents double processing in the UI
+        return;
       }
       
       // Pass through to original handler
       if (this.originalOnMessage) {
+        // If we already parsed successfully, we could optionally pass the parsed data
+        // but to maintain compatibility, we call with the original event
         this.originalOnMessage.call(this.websocket, event);
       }
     };
@@ -155,6 +164,41 @@ export class AckManager {
    */
   send(message: any): void {
     this.websocket.send(JSON.stringify(message));
+  }
+
+  /**
+   * Send multiple messages in parallel and wait for all ACKs
+   * More efficient than sequential sending - sends all messages immediately
+   * and waits for all ACKs to come back
+   * 
+   * @param messages - Array of messages to send
+   * @returns Promise that resolves when all ACKs received or rejects if any fail
+   */
+  async sendBatchWithAck(messages: any[]): Promise<AckResponse[]> {
+    const promises = messages.map(message => this.sendWithAck(message));
+    return Promise.all(promises);
+  }
+
+  /**
+   * Send multiple messages in parallel with individual error handling
+   * Unlike sendBatchWithAck, this doesn't fail fast - it waits for all results
+   * 
+   * @param messages - Array of messages to send
+   * @returns Promise with array of results (success or error for each message)
+   */
+  async sendBatchWithAckSettled(messages: any[]): Promise<Array<{
+    status: 'fulfilled' | 'rejected';
+    value?: AckResponse;
+    reason?: Error;
+  }>> {
+    const promises = messages.map(message => this.sendWithAck(message));
+    const results = await Promise.allSettled(promises);
+    
+    return results.map(result => ({
+      status: result.status,
+      value: result.status === 'fulfilled' ? result.value : undefined,
+      reason: result.status === 'rejected' ? result.reason : undefined,
+    }));
   }
 
   /**

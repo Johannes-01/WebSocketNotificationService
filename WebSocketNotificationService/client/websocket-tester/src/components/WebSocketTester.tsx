@@ -87,7 +87,6 @@ export default function WebSocketTester() {
       };
 
       websocket.onmessage = async (event) => {
-        const clientReceiveTime = new Date(); // Capture receive time immediately
         addLog(`📨 Received message: ${event.data.substring(0, 100)}...`);
         try {
           const data = JSON.parse(event.data);
@@ -100,24 +99,49 @@ export default function WebSocketTester() {
           
           let e2eLatency: number | undefined;
 
-          if (data.publishTimestamp) {
-            const publishTime = new Date(data.publishTimestamp);
+          // Use client-side timestamp if available (no clock skew)
+          // Fall back to server timestamp (may have clock skew)
+          if (data.clientPublishTimestamp) {
+            const publishTime = new Date(data.clientPublishTimestamp);
+            const clientReceiveTime = new Date();
             
             e2eLatency = clientReceiveTime.getTime() - publishTime.getTime();
             
-            // Send metrics to the collector Lambda
+            // Should never be negative with client timestamps, but guard anyway
+            if (e2eLatency < 0) {
+              addLog(`⚠️ Unexpected negative latency: ${e2eLatency}ms (adjusted to 0ms)`);
+              e2eLatency = 0;
+            }
+            
+            addLog(`📊 Latency - E2E: ${e2eLatency}ms (client clock)`);
+          } else if (data.publishTimestamp) {
+            // Fallback to server timestamp (has potential clock skew)
+            const publishTime = new Date(data.publishTimestamp);
+            const clientReceiveTime = new Date();
+            
+            e2eLatency = clientReceiveTime.getTime() - publishTime.getTime();
+            
+            // Guard against clock skew
+            if (e2eLatency < 0) {
+              addLog(`⚠️ Clock skew detected! Latency: ${e2eLatency}ms (adjusted to 0ms)`);
+              e2eLatency = 0;
+            }
+            
+            addLog(`📊 Latency - E2E: ${e2eLatency}ms (server clock)`);
+          }
+          
+          // Send metrics to the collector Lambda (if available)
+          if (e2eLatency !== undefined && data.publishTimestamp) {
             const token = await getIdToken();
             if (token) {
               await metricsService.trackEndToEndLatency(
-                publishTime,
-                clientReceiveTime,
+                new Date(data.publishTimestamp),
+                new Date(),
                 token,
-                data.messageId, // Pass messageId for correlation
-                data.chatId || data.payload?.chatId // Pass chatId for correlation
+                data.messageId,
+                data.chatId || data.payload?.chatId
               );
             }
-            
-            addLog(`📊 Latency - E2E: ${e2eLatency}ms`);
           }
           
           // Track sequence numbers if present
@@ -269,6 +293,9 @@ export default function WebSocketTester() {
       return;
     }
 
+    // Capture client publish time to avoid clock skew with server
+    const clientPublishTimestamp = new Date().toISOString();
+
     const message = {
       action: 'sendMessage',
       targetChannel: 'WebSocket',
@@ -279,7 +306,7 @@ export default function WebSocketTester() {
         chatId,
         eventType,
         content: messageContent,
-        // No timestamp - publisher Lambda adds publishTimestamp automatically
+        clientPublishTimestamp, // Add client-side timestamp for accurate latency measurement
       }
     };
 
@@ -318,6 +345,9 @@ export default function WebSocketTester() {
         return;
       }
 
+      // Capture client publish time to avoid clock skew with server
+      const clientPublishTimestamp = new Date().toISOString();
+
       const message = {
         targetChannel: 'WebSocket',
         messageType,
@@ -327,6 +357,7 @@ export default function WebSocketTester() {
           chatId,
           eventType,
           content: messageContent,
+          clientPublishTimestamp, // Add client-side timestamp for accurate latency measurement
         }
       };
 
@@ -566,54 +597,57 @@ export default function WebSocketTester() {
             return;
           }
 
-          addLog(`   ✅ Sequential WebSocket mode with ACK confirmation (10s timeout per message)`);
+          addLog(`   ✅ Batch WebSocket mode with ACK confirmation (10s timeout per message)`);
+          addLog(`   📊 Strategy: Send all messages immediately, wait for all ACKs in parallel`);
           addLog(`   📊 Tracking: sent, ACK received, failed, timeouts`);
           
+          // Prepare all messages
+          const messagesToSend = [];
+          for (let i = 0; i < bulkCount; i++) {
+            const messageNum = i + 1;
+            messagesToSend.push({
+              ...baseMessage,
+              payload: {
+                ...baseMessage.payload,
+                content: `P2P Batch ACK ${messageNum}/${bulkCount}`,
+                bulkIndex: messageNum,
+                clientPublishTimestamp: new Date().toISOString(), // Add timestamp
+              }
+            });
+          }
+          
+          addLog(`   📤 Sending ${bulkCount} messages in parallel...`);
+          
+          // Send all messages and wait for ACKs in parallel
+          const results = await ackManagerRef.current.sendBatchWithAckSettled(messagesToSend);
+          
+          // Process results
           let ackReceivedCount = 0;
           let timeoutCount = 0;
           
-          for (let i = 0; i < bulkCount; i++) {
-            const messageNum = i + 1;
-            
-            baseMessage.payload.content = `P2P Sequential ACK ${messageNum}/${bulkCount}`;
-            baseMessage.payload.bulkIndex = messageNum;
-
-            try {
-              // Send message and wait for ACK
-              const ack = await ackManagerRef.current.sendWithAck(baseMessage);
-              
+          results.forEach((result, index) => {
+            if (result.status === 'fulfilled') {
               sentCount++;
               ackReceivedCount++;
               
-              // Log successful ACK every 100 messages
-              if (messageNum % 100 === 0) {
-                addLog(`   ✅ ACK ${messageNum}: ${ack.messageId} (seq: ${ack.sequenceNumber || 'N/A'})`);
+              // Log first few successes for debugging
+              if (ackReceivedCount <= 3) {
+                addLog(`   ✅ ACK ${index + 1}: ${result.value?.messageId} (seq: ${result.value?.sequenceNumber || 'N/A'})`);
               }
-            } catch (error) {
+            } else {
               failedCount++;
               
-              // Check if it's a timeout or send error
-              const errorMessage = error instanceof Error ? error.message : String(error);
+              const errorMessage = result.reason?.message || 'Unknown error';
               if (errorMessage.includes('timeout')) {
                 timeoutCount++;
-                console.warn(`ACK timeout for message ${messageNum} (message may still be delivered)`);
-              } else {
-                console.error(`Failed to send message ${messageNum}:`, error);
               }
               
               // Log first few errors for debugging
               if (failedCount <= 3) {
-                addLog(`   ❌ Message ${messageNum} failed: ${errorMessage.substring(0, 60)}`);
+                addLog(`   ❌ Message ${index + 1} failed: ${errorMessage.substring(0, 60)}`);
               }
             }
-
-            // Update progress every 50 messages
-            if (messageNum % 50 === 0) {
-              const progress = Math.floor((messageNum / bulkCount) * 100);
-              setBulkProgress(progress);
-              addLog(`   Progress: ${messageNum}/${bulkCount} (${progress}%) | ACKs: ${ackReceivedCount} | Timeouts: ${timeoutCount}`);
-            }
-          }
+          });
           
           // Final ACK statistics
           addLog(`   📊 ACK Summary: ${ackReceivedCount} confirmed, ${timeoutCount} timeouts, ${failedCount - timeoutCount} failed`);
