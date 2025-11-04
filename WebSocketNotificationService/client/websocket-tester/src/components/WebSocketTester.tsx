@@ -106,7 +106,8 @@ export default function WebSocketTester() {
             const clientReceiveTime = new Date();
             
             e2eLatency = clientReceiveTime.getTime() - publishTime.getTime();
-            
+            console.log(`chatId: ${data.chatId},\n E2E latency: ${e2eLatency}ms`);
+
             // Should never be negative with client timestamps, but guard anyway
             if (e2eLatency < 0) {
               addLog(`⚠️ Unexpected negative latency: ${e2eLatency}ms (adjusted to 0ms)`);
@@ -597,57 +598,80 @@ export default function WebSocketTester() {
             return;
           }
 
-          addLog(`   ✅ Batch WebSocket mode with ACK confirmation (10s timeout per message)`);
-          addLog(`   📊 Strategy: Send all messages immediately, wait for all ACKs in parallel`);
-          addLog(`   📊 Tracking: sent, ACK received, failed, timeouts`);
+          addLog(`   ✅ Sequential WebSocket mode with ACK confirmation (10s timeout per message)`);
+          addLog(`   📊 Strategy: Send one message, wait for ACK, then send next (true sequential)`);
+          addLog(`   📊 Tracking: E2E latency per message, ACKs, timeouts`);
           
-          // Prepare all messages
-          const messagesToSend = [];
+          let ackReceivedCount = 0;
+          let timeoutCount = 0;
+          const latencies: number[] = [];
+          
+          // Send messages one by one, waiting for ACK before sending next
           for (let i = 0; i < bulkCount; i++) {
             const messageNum = i + 1;
-            messagesToSend.push({
+            
+            // Create message with fresh timestamp immediately before sending
+            const message = {
               ...baseMessage,
               payload: {
                 ...baseMessage.payload,
-                content: `P2P Batch ACK ${messageNum}/${bulkCount}`,
+                content: `P2P Sequential ${messageNum}/${bulkCount}`,
                 bulkIndex: messageNum,
-                clientPublishTimestamp: new Date().toISOString(), // Add timestamp
+                clientPublishTimestamp: new Date().toISOString(), // Fresh timestamp per message
               }
-            });
-          }
-          
-          addLog(`   📤 Sending ${bulkCount} messages in parallel...`);
-          
-          // Send all messages and wait for ACKs in parallel
-          const results = await ackManagerRef.current.sendBatchWithAckSettled(messagesToSend);
-          
-          // Process results
-          let ackReceivedCount = 0;
-          let timeoutCount = 0;
-          
-          results.forEach((result, index) => {
-            if (result.status === 'fulfilled') {
+            };
+            
+            const sendTime = Date.now();
+            
+            try {
+              // Send and wait for ACK before next message
+              const ack = await ackManagerRef.current.sendWithAck(message);
+              const receiveTime = Date.now();
+              const latency = receiveTime - sendTime;
+              
               sentCount++;
               ackReceivedCount++;
+              latencies.push(latency);
               
-              // Log first few successes for debugging
-              if (ackReceivedCount <= 3) {
-                addLog(`   ✅ ACK ${index + 1}: ${result.value?.messageId} (seq: ${result.value?.sequenceNumber || 'N/A'})`);
+              // Log first few and every 100th message for debugging
+              if (ackReceivedCount <= 3 || messageNum % 100 === 0) {
+                addLog(`   ✅ Message ${messageNum}: ACK received in ${latency}ms (seq: ${ack.sequenceNumber || 'N/A'})`);
               }
-            } else {
+            } catch (error) {
               failedCount++;
               
-              const errorMessage = result.reason?.message || 'Unknown error';
+              const errorMessage = error instanceof Error ? error.message : 'Unknown error';
               if (errorMessage.includes('timeout')) {
                 timeoutCount++;
               }
               
-              // Log first few errors for debugging
+              // Log first few errors
               if (failedCount <= 3) {
-                addLog(`   ❌ Message ${index + 1} failed: ${errorMessage.substring(0, 60)}`);
+                addLog(`   ❌ Message ${messageNum} failed: ${errorMessage.substring(0, 60)}`);
               }
             }
-          });
+            
+            // Update progress every 10 messages
+            if (messageNum % 10 === 0) {
+              const progress = Math.floor((messageNum / bulkCount) * 100);
+              setBulkProgress(progress);
+              addLog(`   Progress: ${messageNum}/${bulkCount} (${progress}%)`);
+            }
+          }
+          
+          // Calculate latency statistics
+          if (latencies.length > 0) {
+            const avgLatency = latencies.reduce((sum, l) => sum + l, 0) / latencies.length;
+            const minLatency = Math.min(...latencies);
+            const maxLatency = Math.max(...latencies);
+            const p50Latency = latencies.sort((a, b) => a - b)[Math.floor(latencies.length * 0.5)];
+            const p95Latency = latencies.sort((a, b) => a - b)[Math.floor(latencies.length * 0.95)];
+            const p99Latency = latencies.sort((a, b) => a - b)[Math.floor(latencies.length * 0.99)];
+            
+            addLog(`   📊 Latency Stats (ACK time):`);
+            addLog(`      Avg: ${avgLatency.toFixed(1)}ms, Min: ${minLatency}ms, Max: ${maxLatency}ms`);
+            addLog(`      P50: ${p50Latency}ms, P95: ${p95Latency}ms, P99: ${p99Latency}ms`);
+          }
           
           // Final ACK statistics
           addLog(`   📊 ACK Summary: ${ackReceivedCount} confirmed, ${timeoutCount} timeouts, ${failedCount - timeoutCount} failed`);
@@ -1164,7 +1188,7 @@ export default function WebSocketTester() {
                 type="text"
                 value={messageContent}
                 onChange={(e) => setMessageContent(e.target.value)}
-                onKeyPress={(e) => e.key === 'Enter' && sendP2PMessage()}
+                onKeyPress={(e) => e.key === 'Enter' && sendA2PMessage()}
                 placeholder="Type your message..."
                 className="flex-1 px-4 py-2 border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
               />

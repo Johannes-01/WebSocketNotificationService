@@ -133,30 +133,32 @@ export class WebSocketNotificationService extends cdk.Stack {
     });
 
     // Subscribe storage queue to BOTH SNS topics (all messages regardless of type standard or fifo)
-    notificationFifoTopic.addSubscription(new subscription.SqsSubscription(messageStorageQueue, {
+    /*notificationFifoTopic.addSubscription(new subscription.SqsSubscription(messageStorageQueue, {
       filterPolicy: {
         targetChannel: sns.SubscriptionFilter.stringFilter({
           allowlist: ['WebSocket'],
         }),
       },
       rawMessageDelivery: false, // Keep SNS envelope for metadata
-    }));
+    }));*/
 
-    notificationTopic.addSubscription(new subscription.SqsSubscription(messageStorageQueue, {
+    /*notificationTopic.addSubscription(new subscription.SqsSubscription(messageStorageQueue, {
       filterPolicy: {
         targetChannel: sns.SubscriptionFilter.stringFilter({
           allowlist: ['WebSocket'],
         }),
       },
       rawMessageDelivery: false,
-    }));
+    }));*/
 
     const connectionTable = new dynamodb.Table(this, 'ConnectionTable', {
       partitionKey: { name: 'connectionId', type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PROVISIONED,
       removalPolicy: cdk.RemovalPolicy.DESTROY, // Use RETAIN in production
+      readCapacity: 1000,
     });
 
-    // GSI for Chat-ID based routing (supports multiple chat IDs per connection)
+    // GSI f  or Chat-ID based routing (supports multiple chat IDs per connection)
     connectionTable.addGlobalSecondaryIndex({
       indexName: 'ChatIdIndex',
       partitionKey: {
@@ -281,7 +283,7 @@ export class WebSocketNotificationService extends cdk.Stack {
     const p2pWebSocketPublisherAlias = new lambda.Alias(this, 'P2PWebSocketPublisherAlias', {
       aliasName: 'live',
       version: p2pWebSocketPublisherVersion,
-      provisionedConcurrentExecutions: 1,
+      provisionedConcurrentExecutions: 5,
     });
 
     notificationFifoTopic.grantPublish(p2pWebSocketPublisher);
@@ -374,7 +376,7 @@ export class WebSocketNotificationService extends cdk.Stack {
     const a2pHttpPublisherAlias = new lambda.Alias(this, 'A2PHttpPublisherAlias', {
       aliasName: 'live',
       version: a2pHttpPublisherVersion,
-      provisionedConcurrentExecutions: 1,
+      provisionedConcurrentExecutions: 5,
     });
 
     notificationFifoTopic.grantPublish(a2pHttpPublisher);
@@ -433,6 +435,7 @@ export class WebSocketNotificationService extends cdk.Stack {
       },
       timeout: cdk.Duration.seconds(60),
       tracing: lambda.Tracing.ACTIVE,
+      reservedConcurrentExecutions: 100,
     });
 
     // add provisioned concurrency to reduce cold starts
@@ -440,7 +443,7 @@ export class WebSocketNotificationService extends cdk.Stack {
     const processorAlias = new lambda.Alias(this, 'ProcessorAlias', {
       aliasName: 'live',
       version: processorVersion,
-      provisionedConcurrentExecutions: 1,
+      provisionedConcurrentExecutions: 5,
     });
 
     // SQS event source for FIFO messages (ordered, deduplicated)
@@ -451,9 +454,9 @@ export class WebSocketNotificationService extends cdk.Stack {
 
     // SQS event source for Standard messages (high-throughput, reliable)
     processorLambda.addEventSource(new SqsEventSource(webSocketStandardQueue, {
-      batchSize: 10, // Process up to 10 messages per batch
-      maxBatchingWindow: cdk.Duration.seconds(0), // Don't wait - process immediately for low latency!
       reportBatchItemFailures: true,
+      batchSize: 10,
+      maxConcurrency: 10,
     }));
 
     connectionTable.grantReadWriteData(processorLambda);

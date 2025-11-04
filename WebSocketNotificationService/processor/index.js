@@ -129,20 +129,22 @@ const processRecord = async (record) => {
   const promises = connections.Items.map(async (item) => {
     const actualConnectionId = item.actualConnectionId; // The real WebSocket connection ID
     try {
-
-
       await apiGateway.send(new PostToConnectionCommand({
         ConnectionId: actualConnectionId,
         Data: dataToSend,
       }));
-
     } catch (err) {
       // If the connection is gone (410 Gone), delete it from the table
       if (err.statusCode === 410 || err.$metadata?.httpStatusCode === 410) {
-        await docClient.send(new DeleteCommand({
-          TableName: CONNECTION_TABLE,
-          Key: { connectionId: item.connectionId }, // Delete the composite key record
-        }));
+        try {
+          await docClient.send(new DeleteCommand({
+            TableName: CONNECTION_TABLE,
+            Key: { connectionId: item.connectionId }, // Delete the composite key record
+          }));
+        } catch (deleteErr) {
+          console.error(`Error deleting stale connection ${item.connectionId}:`, deleteErr);
+          // Don't throw - deletion is cleanup, not critical
+        }
       } else {
         console.error(`Error sending to connection ${actualConnectionId}:`, err.name, err.message);
         throw err; // Re-throw to trigger SQS retry
@@ -156,27 +158,29 @@ const processRecord = async (record) => {
 exports.handler = async (event) => {
   const batchItemFailures = [];
 
-  // Process all records in parallel for standard queue
-  const results = await Promise.allSettled(
-    event.Records.map(async (record) => {
-      try {
-        await processRecord(record);
-        return { success: true, record };
-      } catch (error) {
-        console.error('Error processing record:', record.messageId, error.name, error.message);
-        return { success: false, record };
+  try {   
+    const results = await Promise.allSettled(
+      event.Records.map((record) => processRecord(record))
+    );
+
+    results.forEach((result, index) => {
+      if (result.status === 'rejected') {
+        const record = event.Records[index];
+        console.error(`Failed to process record ${record.messageId}:`, result.reason);
+        batchItemFailures.push({
+          itemIdentifier: record.messageId,
+        });
       }
-    })
-  );
+    });
 
-  // Collect failures for SQS retry
-  results.forEach((result) => {
-    if (result.status === 'fulfilled' && !result.value.success) {
-      batchItemFailures.push({
-        itemIdentifier: result.value.record.messageId,
-      });
-    }
-  });
-
-  return { batchItemFailures };
+    return { batchItemFailures }; 
+  } catch (error) {
+    console.error('Critical error in message processor:', error);
+    // Return all records as failed to trigger full batch retry
+    return {
+      batchItemFailures: event.Records.map(record => ({
+        itemIdentifier: record.messageId
+      }))
+    };
+  }
 };

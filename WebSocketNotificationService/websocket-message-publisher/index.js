@@ -1,6 +1,7 @@
 const { SNSClient, PublishCommand } = require('@aws-sdk/client-sns');
 const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
 const { DynamoDBDocumentClient, UpdateCommand } = require('@aws-sdk/lib-dynamodb');
+const { ApiGatewayManagementApiClient, PostToConnectionCommand } = require('@aws-sdk/client-apigatewaymanagementapi');
 
 const sns = new SNSClient({});
 const dynamoClient = new DynamoDBClient({});
@@ -32,6 +33,9 @@ exports.handler = async (event) => {
 
         // Extract authenticated user ID from WebSocket authorizer context
         const cognitoUserId = event.requestContext?.authorizer?.cognitoUserId;
+        const connectionId = event.requestContext?.connectionId;
+        const domainName = event.requestContext?.domainName;
+        const stage = event.requestContext?.stage;
         
         if (!cognitoUserId) {
             console.error('No authenticated user found in WebSocket context');
@@ -56,7 +60,7 @@ exports.handler = async (event) => {
             };
         }
 
-        const { targetChannel, payload, messageType = 'standard', messageGroupId, generateSequence } = messageBody;
+        const { targetChannel, payload, messageType = 'standard', messageGroupId, generateSequence, requestAck, ackId } = messageBody;
 
         if (!targetChannel || !payload) {
             console.error('Missing required parameters in body');
@@ -127,6 +131,43 @@ exports.handler = async (event) => {
             messageGroupId: messageType === 'fifo' ? (messageGroupId || cognitoUserId) : undefined,
             topicArn: topicArn
         });
+
+        // Send ACK if requested
+        if (requestAck && ackId && connectionId) {
+            try {
+                const apiGatewayClient = new ApiGatewayManagementApiClient({
+                    endpoint: `https://${domainName}/${stage}`
+                });
+
+                const ackMessage = {
+                    type: 'ack',
+                    ackId: ackId,
+                    status: 'success',
+                    messageId: result.MessageId,
+                    messageType: messageType,
+                    timestamp: new Date().toISOString(),
+                    snsMessageId: result.MessageId,
+                    sequenceNumber: result.SequenceNumber || null
+                };
+
+                const postCommand = new PostToConnectionCommand({
+                    ConnectionId: connectionId,
+                    Data: JSON.stringify(ackMessage)
+                });
+
+                await apiGatewayClient.send(postCommand);
+                
+                console.log('ACK sent successfully:', {
+                    connectionId,
+                    ackId,
+                    messageId: result.MessageId,
+                });
+            } catch (ackError) {
+                console.error('Failed to send ACK to client (message still published):', ackError);
+                // Don't fail the entire request if ACK sending fails
+                // The message was already published successfully
+            }
+        }
 
         return {
             statusCode: 200,
